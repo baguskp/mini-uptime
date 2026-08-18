@@ -99,6 +99,7 @@ podman run --rm -v "$PWD:/src:Z" -w /src docker.io/library/golang:1.22 go test .
 - Critical check/monitor/retention DB write errors now log context instead of being silently discarded.
 - SQLite busy writes retry up to 4 times with bounded backoff via `execRetry`; covered by unit test.
 - Runtime DB recovery: WAL checkpointed after backup; Compose stop grace period set to 15s; connection pool kept responsive at 8 open / 4 idle connections.
+- Automated smoke test at `scripts/smoke.sh` covers login, CSRF rejection, auth pages, invalid monitor validation, and authenticated SSE.
 - UI consistency pass: login/setup auth layouts, shared nav alignment, settings form spacing, monitor group datalist filter, and search alignment.
 - Monitor detail latency view now shows Average, P95, Best, Worst, vertical latency bars, and humanized timestamps.
 - Display prioritizes DOWN monitors and marks them red with `DOWN` badge.
