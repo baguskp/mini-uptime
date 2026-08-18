@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,6 +49,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(4)
 	defer db.Close()
 	if err := migrate(db); err != nil {
 		log.Fatal(err)
@@ -115,7 +118,7 @@ func main() {
 }
 
 func migrate(db *sql.DB) error {
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL, name TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('http','tcp','ping')), target TEXT NOT NULL, interval_seconds INTEGER NOT NULL DEFAULT 60, enabled INTEGER NOT NULL DEFAULT 1, current_status TEXT NOT NULL DEFAULT 'unknown', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, latency_ms INTEGER NOT NULL, error TEXT, checked_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_checks_monitor_checked ON checks(monitor_id,checked_at); CREATE INDEX IF NOT EXISTS idx_incidents_monitor_ended ON incidents(monitor_id,ended_at); CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_one_open ON incidents(monitor_id) WHERE ended_at IS NULL; CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at); INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);`); err != nil {
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL, name TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('http','tcp','ping')), target TEXT NOT NULL, interval_seconds INTEGER NOT NULL DEFAULT 60, enabled INTEGER NOT NULL DEFAULT 1, current_status TEXT NOT NULL DEFAULT 'unknown', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, latency_ms INTEGER NOT NULL, error TEXT, checked_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_checks_monitor_checked ON checks(monitor_id,checked_at); CREATE INDEX IF NOT EXISTS idx_incidents_monitor_ended ON incidents(monitor_id,ended_at); CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_one_open ON incidents(monitor_id) WHERE ended_at IS NULL; CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at); INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);`); err != nil {
 		return err
 	}
 	var hasGroup bool
@@ -166,7 +169,11 @@ func migrate(db *sql.DB) error {
 }
 func configured(db *sql.DB) bool {
 	var n int
-	return db.QueryRow("SELECT COUNT(*) FROM admins").Scan(&n) == nil && n > 0
+	if err := db.QueryRow("SELECT COUNT(*) FROM admins").Scan(&n); err != nil {
+		log.Printf("check configured: %v", err)
+		return true
+	}
+	return n > 0
 }
 func setupPage(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -239,7 +246,9 @@ func requireAuth(db *sql.DB, next http.HandlerFunc) http.HandlerFunc {
 func logout(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if c, err := r.Cookie("session"); err == nil {
-			_, _ = db.Exec("DELETE FROM sessions WHERE token=?", c.Value)
+			if _, err := db.Exec("DELETE FROM sessions WHERE token=?", c.Value); err != nil {
+				log.Printf("logout session: %v", err)
+			}
 		}
 		http.SetCookie(w, &http.Cookie{Name: "session", MaxAge: -1, Path: "/", HttpOnly: true})
 		http.Redirect(w, r, "/login", 303)
@@ -302,7 +311,7 @@ func display(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		groupName := strings.TrimSpace(r.URL.Query().Get("group"))
-		rows, _ := db.Query("SELECT m.id,m.name,m.type,m.target,m.current_status,m.last_latency_ms FROM monitors m LEFT JOIN groups g ON g.id=m.group_id WHERE m.enabled=1 AND (?='' OR g.name=?) ORDER BY m.name", groupName, groupName)
+		rows, _ := db.Query("SELECT m.id,m.name,m.type,m.target,m.current_status,m.last_latency_ms FROM monitors m LEFT JOIN groups g ON g.id=m.group_id WHERE m.enabled=1 AND (?='' OR g.name=?) ORDER BY CASE m.current_status WHEN 'down' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,m.name", groupName, groupName)
 		if rows == nil {
 			http.Error(w, "unable to load monitors", 500)
 			return
@@ -335,7 +344,10 @@ func dashboard(db *sql.DB) http.HandlerFunc {
 		for rows.Next() {
 			var id, lat int
 			var name, typ, target, status string
-			_ = rows.Scan(&id, &name, &typ, &target, &status, &lat)
+			if err := rows.Scan(&id, &name, &typ, &target, &status, &lat); err != nil {
+				log.Printf("dashboard monitor scan: %v", err)
+				continue
+			}
 			var checks, success int
 			_ = db.QueryRow("SELECT COUNT(*),COALESCE(SUM(status='up'),0) FROM checks WHERE monitor_id=?", id).Scan(&checks, &success)
 			uptime := 0
@@ -349,7 +361,10 @@ func dashboard(db *sql.DB) http.HandlerFunc {
 		var incidents []map[string]string
 		for ir.Next() {
 			var name, started, ended string
-			_ = ir.Scan(&name, &started, &ended)
+			if err := ir.Scan(&name, &started, &ended); err != nil {
+				log.Printf("dashboard incident scan: %v", err)
+				continue
+			}
 			incidents = append(incidents, map[string]string{"Name": name, "Started": started, "Ended": ended})
 		}
 		render(w, "dashboard.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "Total": total, "Up": up, "Down": down, "Monitors": monitors, "Incidents": incidents})
@@ -423,7 +438,8 @@ type monitor struct {
 func monitorsPage(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
-		rows, err := db.Query("SELECT m.id,COALESCE(m.group_id,0),COALESCE(g.name,''),m.name,m.type,m.target,m.interval_seconds,m.enabled FROM monitors m LEFT JOIN groups g ON g.id=m.group_id WHERE m.name LIKE ? OR m.target LIKE ? ORDER BY m.id DESC", "%"+q+"%", "%"+q+"%")
+		groupName := strings.TrimSpace(r.URL.Query().Get("group"))
+		rows, err := db.Query("SELECT m.id,COALESCE(m.group_id,0),COALESCE(g.name,''),m.name,m.type,m.target,m.interval_seconds,m.enabled FROM monitors m LEFT JOIN groups g ON g.id=m.group_id WHERE (m.name LIKE ? OR m.target LIKE ?) AND (?='' OR g.name=?) ORDER BY m.id DESC", "%"+q+"%", "%"+q+"%", groupName, groupName)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -441,10 +457,21 @@ func monitorsPage(db *sql.DB) http.HandlerFunc {
 			list = append(list, m)
 		}
 		token := csrfData(w, r)["CSRF"]
+		groups := []string{}
+		gr, _ := db.Query("SELECT name FROM groups ORDER BY name")
+		if gr != nil {
+			defer gr.Close()
+			for gr.Next() {
+				var n string
+				if gr.Scan(&n) == nil {
+					groups = append(groups, n)
+				}
+			}
+		}
 		for i := range list {
 			list[i].CSRF = token
 		}
-		render(w, "monitors.html", map[string]any{"Monitors": list, "Query": q, "CSRF": token})
+		render(w, "monitors.html", map[string]any{"Monitors": list, "Query": q, "Group": groupName, "Groups": groups, "CSRF": token})
 	}
 }
 func monitorForm(w http.ResponseWriter, r *http.Request) {
@@ -465,7 +492,10 @@ func monitorEditPage(db *sql.DB) http.HandlerFunc {
 			defer rows.Close()
 			for rows.Next() {
 				var g group
-				_ = rows.Scan(&g.ID, &g.Name)
+				if err := rows.Scan(&g.ID, &g.Name); err != nil {
+					log.Printf("monitor group scan: %v", err)
+					continue
+				}
 				groups = append(groups, g)
 			}
 		}
@@ -612,21 +642,31 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 	latency := time.Since(started).Milliseconds()
 	now := time.Now().UTC().Format(time.RFC3339)
 	var previous string
-	_ = db.QueryRow("SELECT current_status FROM monitors WHERE id=?", id).Scan(&previous)
+	if err := db.QueryRow("SELECT current_status FROM monitors WHERE id=?", id).Scan(&previous); err != nil {
+		log.Printf("read monitor %d status: %v", id, err)
+	}
 	if _, err := db.Exec("INSERT INTO checks(monitor_id,status,latency_ms,error,checked_at) VALUES(?,?,?,?,?)", id, status, latency, message, now); err != nil {
 		log.Printf("insert check %d: %v", id, err)
 	}
 	if status == "down" && previous != "down" {
 		var monitorName string
-		_ = db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName)
+		if err := db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName); err != nil {
+			log.Printf("read monitor %d name: %v", id, err)
+		}
 		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime DOWN: %s: %s", monitorName, message)) }()
-		_, _ = db.Exec("INSERT OR IGNORE INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)", id, now, message)
+		if _, err := db.Exec("INSERT OR IGNORE INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)", id, now, message); err != nil {
+			log.Printf("open incident %d: %v", id, err)
+		}
 	}
 	if status == "up" && previous == "down" {
 		var monitorName string
-		_ = db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName)
+		if err := db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName); err != nil {
+			log.Printf("read monitor %d name: %v", id, err)
+		}
 		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime RECOVERED: %s", monitorName)) }()
-		_, _ = db.Exec("UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL", now, id)
+		if _, err := db.Exec("UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL", now, id); err != nil {
+			log.Printf("close incident %d: %v", id, err)
+		}
 	}
 	if _, err := db.Exec("UPDATE monitors SET current_status=?,last_latency_ms=?,last_error=?,checked_at=? WHERE id=?", status, latency, message, now, id); err != nil {
 		log.Printf("update monitor %d: %v", id, err)
@@ -792,7 +832,10 @@ func incidentsPage(db *sql.DB) http.HandlerFunc {
 		var incidents []map[string]string
 		for rows.Next() {
 			var started, ended, name, e string
-			_ = rows.Scan(&started, &ended, &name, &e)
+			if err := rows.Scan(&started, &ended, &name, &e); err != nil {
+				log.Printf("incident scan: %v", err)
+				continue
+			}
 			incidents = append(incidents, map[string]string{"Started": started, "Ended": ended, "Monitor": name, "Error": e})
 		}
 		render(w, "incidents.html", incidents)
@@ -817,17 +860,61 @@ func monitorDetail(db *sql.DB) http.HandlerFunc {
 		for rows.Next() {
 			var s, e, at string
 			var l int
-			_ = rows.Scan(&s, &l, &e, &at)
+			if err := rows.Scan(&s, &l, &e, &at); err != nil {
+				log.Printf("check scan: %v", err)
+				continue
+			}
 			if l > maxLatency {
 				maxLatency = l
 			}
 			checks = append(checks, map[string]any{"Status": s, "Latency": l, "Error": e, "At": at})
 		}
+		sum := 0
+		minLatency, maxLatency := int(^uint(0)>>1), 0
 		for _, c := range checks {
-			c["Width"] = c["Latency"].(int) * 100 / maxLatency
+			l := c["Latency"].(int)
+			sum += l
+			if l < minLatency {
+				minLatency = l
+			}
+			if l > maxLatency {
+				maxLatency = l
+			}
 		}
-		render(w, "monitor-detail.html", map[string]any{"Monitor": m, "Checks": checks})
+		if len(checks) == 0 {
+			minLatency = 0
+		}
+		avg := 0
+		if len(checks) > 0 {
+			avg = sum / len(checks)
+		}
+		p95 := 0
+		if len(checks) > 0 {
+			vals := make([]int, 0, len(checks))
+			for _, c := range checks {
+				vals = append(vals, c["Latency"].(int))
+			}
+			sort.Ints(vals)
+			p95 = vals[(len(vals)*95+99)/100-1]
+		}
+		for _, c := range checks {
+			l := c["Latency"].(int)
+			h := 8
+			if maxLatency > 0 {
+				h = max(8, l*100/maxLatency)
+			}
+			c["Height"] = h
+			c["Time"] = humanTime(c["At"].(string))
+		}
+		render(w, "monitor-detail.html", map[string]any{"Monitor": m, "Checks": checks, "Avg": avg, "P95": p95, "Min": minLatency, "Max": maxLatency})
 	}
+}
+func humanTime(value string) string {
+	t, e := time.Parse(time.RFC3339, value)
+	if e != nil {
+		return value
+	}
+	return t.Local().Format("02 Jan, 15:04")
 }
 func validMonitor(typ, name, target string, interval int) bool {
 	target = strings.TrimSpace(target)
@@ -900,7 +987,9 @@ func render(w http.ResponseWriter, name string, data any) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	_ = t.Execute(w, data)
+	if err := t.Execute(w, data); err != nil {
+		log.Printf("render %s: %v", name, err)
+	}
 }
 func hashPassword(p string) (string, error) {
 	salt := make([]byte, 16)
@@ -917,7 +1006,13 @@ func checkPassword(p, h string) bool {
 	got := argon2.IDKey([]byte(p), salt, 3, 64*1024, 2, 32)
 	return string(got) == string(expected)
 }
-func randomToken() string { b := make([]byte, 32); _, _ = rand.Read(b); return fmt.Sprintf("%x", b) }
+func randomToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Printf("random token: %v", err)
+	}
+	return fmt.Sprintf("%x", b)
+}
 func cookieValue(c *http.Cookie, err error) string {
 	if err != nil {
 		return ""

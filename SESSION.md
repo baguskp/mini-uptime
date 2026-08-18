@@ -97,6 +97,9 @@ podman run --rm -v "$PWD:/src:Z" -w /src docker.io/library/golang:1.22 go test .
 - Benchmark baseline: `validMonitor` 192.6 ns/op, 144 B/op, 1 allocs/op.
 - Test suite covers password hash round-trip, monitor validation, retention cleanup; `go test -race ./...` passes.
 - Critical check/monitor/retention DB write errors now log context instead of being silently discarded.
+- UI consistency pass: login/setup auth layouts, shared nav alignment, settings form spacing, monitor group datalist filter, and search alignment.
+- Monitor detail latency view now shows Average, P95, Best, Worst, vertical latency bars, and humanized timestamps.
+- Display prioritizes DOWN monitors and marks them red with `DOWN` badge.
 - Current status update logic depends on existing DB migration columns.
 
 ## Next session order
