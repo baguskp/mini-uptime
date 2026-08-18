@@ -754,8 +754,14 @@ func settingsSave(db *sql.DB) http.HandlerFunc {
 				return
 			}
 		}
-		for _, v := range []struct{ k, n string }{{"telegram_token", "token"}, {"telegram_chat_id", "chat_id"}} {
-			if _, e := db.Exec("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", v.k, strings.TrimSpace(r.FormValue(v.n))); e != nil {
+		if token := strings.TrimSpace(r.FormValue("token")); token != "" {
+			if _, e := db.Exec("INSERT INTO settings(key,value) VALUES('telegram_token',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", token); e != nil {
+				http.Error(w, e.Error(), 500)
+				return
+			}
+		}
+		if chat := strings.TrimSpace(r.FormValue("chat_id")); chat != "" {
+			if _, e := db.Exec("INSERT INTO settings(key,value) VALUES('telegram_chat_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", chat); e != nil {
 				http.Error(w, e.Error(), 500)
 				return
 			}
