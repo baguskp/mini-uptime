@@ -1,0 +1,112 @@
+# MiniUptime — Session Handoff
+
+## Run
+
+```bash
+podman compose up -d --build --force-recreate
+curl http://localhost:3001/health
+```
+
+Expected:
+
+```json
+{"status":"ok"}
+```
+
+Podman uses external Docker Compose provider. Fedora SELinux bind mount uses `./data:/app/data:Z`. `compose.yaml` adds `NET_RAW` for ICMP ping.
+
+## Credentials
+
+Current admin created during DB reset:
+
+```text
+username: admin123
+password: correct-horse-battery
+```
+
+Password may change. Stored Argon2id hash. Do not assume credentials remain unchanged.
+
+## Implemented
+
+- Go `net/http` server
+- SQLite, WAL, migrations
+- Embedded templates/static via `//go:embed`
+- `/health`
+- Graceful shutdown
+- Setup, login, logout
+- Argon2id password hash
+- SQLite-persistent sessions
+- CSRF cookie + hidden form token
+- Monitor CRUD: HTTP, TCP, Ping; enable/disable; edit/delete
+- Groups CRUD and monitor group assignment
+- Scheduler, 4-worker queue, interval checks
+- HTTP/TCP/Ping checks
+- 3 retries with 500ms and 1000ms delay
+- Monitor current status, latency, error, checked time
+- Checks history
+- Incidents open/recovery
+- Monitor detail and incidents list
+- Dashboard summary, monitor table, uptime percentage, recent incidents
+- Basic responsive CSS
+- SSE `/events` with dashboard reload
+- Debian slim runtime with `ca-certificates` and `iputils-ping`
+- `NET_RAW` Podman capability for Ping
+- Target placeholders and backend validation:
+  - HTTP: `https://example.com`
+  - TCP: `example.com:443`
+  - Ping: `8.8.8.8`
+
+## Important fixes
+
+1. Static files required `fs.Sub(assets, "web/static")`; `/static/app.css` now returns 200.
+2. Existing SQLite DB needed migrations for `group_id`, `current_status`, `last_latency_ms`, `last_error`, `checked_at`.
+3. CSRF token must reuse existing cookie. Generating token on every render caused repeated `invalid csrf token`.
+4. Runtime needs `ca-certificates`; otherwise HTTPS failed with:
+
+```text
+x509: certificate signed by unknown authority
+```
+
+5. Ping needs `NET_RAW`; without it:
+
+```text
+fork/exec /usr/bin/ping: operation not permitted
+```
+
+6. `ping` target is hostname/IP, never URL. HTTP target is URL. TCP target is `host:port`.
+
+## Current known gaps
+
+- No git repository exists yet. User said “commit dulu”; initialize git and create first commit next session.
+- `main.go` is intentionally compact but now large. Avoid broad refactor.
+- `go.sum` may be absent on host because host has no `go`; Docker build runs `go mod tidy`.
+- `main_test.go` exists, but host Go unavailable. Run test in container:
+
+```bash
+podman run --rm -v "$PWD:/src:Z" -w /src docker.io/library/golang:1.22 go test ./...
+```
+
+- Phase 6 incomplete: monitor filtering, response graph, UI consistency on all pages.
+- Phase 7 SSE is minimal: sends `status` event every 5 sec; dashboard reloads. No payload/reconnect strategy.
+- Phase 8 Telegram not started.
+- Phase 9 Display mode/PIN not started. Do not confuse Display PIN with Ping.
+- Current Ping tests historically included bad target `https://google.com`; edit to `google.com` or IP.
+- Session persistence exists, but clean expired-session retention is not implemented.
+- Current status update logic depends on existing DB migration columns.
+
+## Next session order
+
+1. Check `git status`; initialize git.
+2. Run container test command above.
+3. Create first commit with meaningful message.
+4. Verify HTTP, TCP, Ping with correct targets.
+5. Finish Phase 6 filtering and response graph.
+6. Improve SSE payload only if needed.
+
+## Do not
+
+- Add React/Vue/Node runtime.
+- Add PostgreSQL/Redis.
+- Replace SQLite.
+- Delete `data/miniuptime.db` without backup confirmation.
+- Claim Phase 6/7 complete before tests and manual checks.

@@ -1,0 +1,1 @@
+<!doctype html><html><body><h1>Incidents</h1><table><tr><th>Monitor</th><th>Started</th><th>Ended</th><th>Error</th></tr>{{range .}}<tr><td>{{.Monitor}}</td><td>{{.Started}}</td><td>{{.Ended}}</td><td>{{.Error}}</td></tr>{{else}}<tr><td colspan="4">No incidents</td></tr>{{end}}</table><a href="/dashboard">Dashboard</a></body></html>

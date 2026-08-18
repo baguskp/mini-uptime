@@ -1,0 +1,13 @@
+services:
+  miniuptime:
+    build: .
+    container_name: miniuptime
+    restart: unless-stopped
+    cap_add:
+      - NET_RAW
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./data:/app/data:Z
+    environment:
+      TZ: Asia/Jakarta
