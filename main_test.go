@@ -34,6 +34,16 @@ func TestCleanupRetention(t *testing.T) {
 	}
 }
 
+func TestPasswordRoundTrip(t *testing.T) {
+	h, e := hashPassword("correct horse battery staple")
+	if e != nil || !checkPassword("correct horse battery staple", h) {
+		t.Fatal("password rejected")
+	}
+	if checkPassword("wrong", h) {
+		t.Fatal("wrong password accepted")
+	}
+}
+
 func TestValidMonitor(t *testing.T) {
 	if !validMonitor("http", "site", "https://example.com", 10) {
 		t.Fatal("valid monitor rejected")
@@ -46,5 +56,14 @@ func TestValidMonitor(t *testing.T) {
 	}
 	if validMonitor("http", "site", "target", 9) {
 		t.Fatal("short interval accepted")
+	}
+	if !validMonitor("tcp", "db", "localhost:5432", 10) {
+		t.Fatal("valid tcp rejected")
+	}
+	if !validMonitor("ping", "router", "192.168.1.1", 10) {
+		t.Fatal("valid ping rejected")
+	}
+	if validMonitor("ping", "router", "https://example.com", 10) {
+		t.Fatal("url accepted as ping")
 	}
 }

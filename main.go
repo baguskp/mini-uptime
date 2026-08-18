@@ -34,6 +34,10 @@ var sessions = struct {
 	sync.Mutex
 	items map[string]time.Time
 }{items: make(map[string]time.Time)}
+var displayAttempts = struct {
+	sync.Mutex
+	items map[string][]time.Time
+}{items: make(map[string][]time.Time)}
 
 func main() {
 	dbPath := getenv("DATABASE_PATH", "/app/data/miniuptime.db")
@@ -647,7 +651,15 @@ func settingsSave(db *sql.DB) http.HandlerFunc {
 			}
 		}
 		if pin := strings.TrimSpace(r.FormValue("display_pin")); pin != "" {
-			db.Exec("INSERT INTO settings(key,value) VALUES('display_pin',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", pin)
+			hash, e := hashPassword(pin)
+			if e != nil {
+				http.Error(w, "unable to save display PIN", 500)
+				return
+			}
+			if _, e = db.Exec("INSERT INTO settings(key,value) VALUES('display_pin',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", hash); e != nil {
+				http.Error(w, e.Error(), 500)
+				return
+			}
 		}
 		for _, v := range []struct{ k, n string }{{"telegram_token", "token"}, {"telegram_chat_id", "chat_id"}} {
 			if _, e := db.Exec("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", v.k, strings.TrimSpace(r.FormValue(v.n))); e != nil {
@@ -662,11 +674,34 @@ func displayUnlock(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var pin string
 		db.QueryRow("SELECT value FROM settings WHERE key='display_pin'").Scan(&pin)
-		if pin == "" || r.FormValue("pin") != pin {
+		ip := strings.Split(r.RemoteAddr, ":")[0]
+		displayAttempts.Lock()
+		now := time.Now()
+		recent := displayAttempts.items[ip][:0]
+		for _, at := range displayAttempts.items[ip] {
+			if now.Sub(at) < time.Minute {
+				recent = append(recent, at)
+			}
+		}
+		displayAttempts.items[ip] = recent
+		if len(recent) >= 5 {
+			displayAttempts.Unlock()
+			http.Error(w, "too many display PIN attempts", 429)
+			return
+		}
+		displayAttempts.items[ip] = append(recent, now)
+		displayAttempts.Unlock()
+		valid := false
+		if strings.HasPrefix(pin, "$argon2id$") {
+			valid = checkPassword(r.FormValue("pin"), pin)
+		} else {
+			valid = pin != "" && r.FormValue("pin") == pin
+		}
+		if !valid {
 			http.Error(w, "invalid display PIN", 401)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{Name: "display_auth", Value: "1", Path: "/display", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+		http.SetCookie(w, &http.Cookie{Name: "display_auth", Value: "1", Path: "/display", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil, MaxAge: 86400})
 		http.Redirect(w, r, "/display", 303)
 	}
 }
