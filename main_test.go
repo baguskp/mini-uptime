@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	_ "modernc.org/sqlite"
 	"testing"
+	"time"
 )
 
 func BenchmarkValidMonitor(b *testing.B) {
@@ -53,6 +54,25 @@ func TestCleanupRetention(t *testing.T) {
 	db.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&n)
 	if n != 1 {
 		t.Fatalf("sessions retained: %d", n)
+	}
+}
+
+func TestDisplayPINHash(t *testing.T) {
+	h, e := hashPassword("1234")
+	if e != nil || !checkPassword("1234", h) {
+		t.Fatal("pin hash failed")
+	}
+	if checkPassword("4321", h) {
+		t.Fatal("wrong pin accepted")
+	}
+}
+
+func TestHumanTime(t *testing.T) {
+	if got := humanTime("2026-08-18T14:42:10Z"); got != time.Date(2026, 8, 18, 14, 42, 10, 0, time.UTC).Local().Format("02 Jan, 15:04") {
+		t.Fatalf("humanTime=%q", got)
+	}
+	if got := humanTime("bad"); got != "bad" {
+		t.Fatalf("invalid time=%q", got)
 	}
 }
 
