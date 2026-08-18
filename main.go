@@ -59,7 +59,7 @@ func main() {
 	go retentionLoop(db)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /events", requireAuth(db, events(db)))
+	mux.HandleFunc("GET /events", eventsAccess(db))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		if err := db.Ping(); err != nil {
 			http.Error(w, "database unavailable", 503)
@@ -254,6 +254,30 @@ func logout(db *sql.DB) http.HandlerFunc {
 		http.Redirect(w, r, "/login", 303)
 	}
 }
+func eventsAccess(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if c, e := r.Cookie("session"); e == nil {
+			var x string
+			if db.QueryRow("SELECT token FROM sessions WHERE token=?", c.Value).Scan(&x) == nil {
+				events(db)(w, r)
+				return
+			}
+		}
+		var mode string
+		db.QueryRow("SELECT value FROM settings WHERE key='display_mode'").Scan(&mode)
+		if mode == "public" {
+			events(db)(w, r)
+			return
+		}
+		if mode == "pin" {
+			if c, e := r.Cookie("display_auth"); e == nil && c.Value == "1" {
+				events(db)(w, r)
+				return
+			}
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}
+}
 func events(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
@@ -285,7 +309,7 @@ func events(db *sql.DB) http.HandlerFunc {
 				}
 				rows.Close()
 				payload, _ := json.Marshal(statuses)
-				fmt.Fprintf(w, "event: status\\ndata: %s\\n\\n", payload)
+				fmt.Fprintf(w, "event: status\ndata: %s\n\n", payload)
 				flusher.Flush()
 			}
 		}
