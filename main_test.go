@@ -3,6 +3,8 @@ package main
 import (
 	"database/sql"
 	_ "modernc.org/sqlite"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -54,6 +56,22 @@ func TestCleanupRetention(t *testing.T) {
 	db.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&n)
 	if n != 1 {
 		t.Fatalf("sessions retained: %d", n)
+	}
+}
+
+func TestSettingsDoesNotRenderTelegramToken(t *testing.T) {
+	db, e := sql.Open("sqlite", ":memory:")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer db.Close()
+	db.Exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+	db.Exec("INSERT INTO settings VALUES('telegram_token','secret-token')")
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/settings", nil)
+	settingsPage(db)(w, r)
+	if strings.Contains(w.Body.String(), "secret-token") {
+		t.Fatal("telegram token rendered")
 	}
 }
 
