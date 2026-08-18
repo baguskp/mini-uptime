@@ -12,6 +12,28 @@ func BenchmarkValidMonitor(b *testing.B) {
 	}
 }
 
+func TestExecRetry(t *testing.T) {
+	db, e := sql.Open("sqlite", ":memory:")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer db.Close()
+	if _, e = db.Exec("CREATE TABLE items(value TEXT)"); e != nil {
+		t.Fatal(e)
+	}
+	if e := execRetry(db, "INSERT INTO items(value) VALUES(?)", "ok"); e != nil {
+		t.Fatal(e)
+	}
+	var v string
+	db.QueryRow("SELECT value FROM items").Scan(&v)
+	if v != "ok" {
+		t.Fatalf("value=%q", v)
+	}
+	if e := execRetry(db, "INSERT INTO missing(value) VALUES(?)", "bad"); e == nil {
+		t.Fatal("expected SQL error")
+	}
+}
+
 func TestCleanupRetention(t *testing.T) {
 	db, e := sql.Open("sqlite", ":memory:")
 	if e != nil {

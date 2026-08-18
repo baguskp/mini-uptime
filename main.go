@@ -214,8 +214,16 @@ func loginPage(db *sql.DB) http.HandlerFunc {
 }
 func loginSubmit(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		username := strings.TrimSpace(r.FormValue("username"))
+		password := r.FormValue("password")
 		var h string
-		if db.QueryRow("SELECT password_hash FROM admins WHERE username=?", r.FormValue("username")).Scan(&h) != nil || !checkPassword(r.FormValue("password"), h) {
+		if err := db.QueryRow("SELECT password_hash FROM admins WHERE username=?", username).Scan(&h); err != nil {
+			log.Printf("login lookup %q: %v", username, err)
+			http.Error(w, "invalid credentials", 401)
+			return
+		}
+		if !checkPassword(password, h) {
+			log.Printf("login password mismatch for %q", username)
 			http.Error(w, "invalid credentials", 401)
 			return
 		}
@@ -335,7 +343,7 @@ func display(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		groupName := strings.TrimSpace(r.URL.Query().Get("group"))
-		rows, _ := db.Query("SELECT m.id,m.name,m.type,m.target,m.current_status,m.last_latency_ms FROM monitors m LEFT JOIN groups g ON g.id=m.group_id WHERE m.enabled=1 AND (?='' OR g.name=?) ORDER BY CASE m.current_status WHEN 'down' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,m.name", groupName, groupName)
+		rows, _ := db.Query("SELECT m.id,m.name,m.type,m.target,m.current_status,m.last_latency_ms,COALESCE(i.started_at,'') FROM monitors m LEFT JOIN groups g ON g.id=m.group_id LEFT JOIN incidents i ON i.monitor_id=m.id AND i.ended_at IS NULL WHERE m.enabled=1 AND (?='' OR g.name=?) ORDER BY CASE m.current_status WHEN 'down' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,m.name", groupName, groupName)
 		if rows == nil {
 			http.Error(w, "unable to load monitors", 500)
 			return
@@ -344,9 +352,9 @@ func display(db *sql.DB) http.HandlerFunc {
 		var monitors []map[string]any
 		for rows.Next() {
 			var id, lat int
-			var name, typ, target, status string
-			if rows.Scan(&id, &name, &typ, &target, &status, &lat) == nil {
-				monitors = append(monitors, map[string]any{"ID": id, "Name": name, "Type": typ, "Target": target, "Status": status, "Latency": lat})
+			var name, typ, target, status, downSince string
+			if rows.Scan(&id, &name, &typ, &target, &status, &lat, &downSince) == nil {
+				monitors = append(monitors, map[string]any{"ID": id, "Name": name, "Type": typ, "Target": target, "Status": status, "Latency": lat, "DownSince": humanTime(downSince)})
 			}
 		}
 		render(w, "display.html", map[string]any{"Monitors": monitors, "Group": groupName})
@@ -598,6 +606,19 @@ func retentionLoop(db *sql.DB) {
 		<-ticker.C
 	}
 }
+func execRetry(db *sql.DB, q string, args ...any) error {
+	var err error
+	for i := 0; i < 4; i++ {
+		if _, err = db.Exec(q, args...); err == nil {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "locked") {
+			return err
+		}
+		time.Sleep(time.Duration(i+1) * 100 * time.Millisecond)
+	}
+	return err
+}
 func cleanupRetention(db *sql.DB) {
 	cutoff := time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC3339)
 	if _, err := db.Exec("DELETE FROM checks WHERE checked_at < ?", cutoff); err != nil {
@@ -669,7 +690,7 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 	if err := db.QueryRow("SELECT current_status FROM monitors WHERE id=?", id).Scan(&previous); err != nil {
 		log.Printf("read monitor %d status: %v", id, err)
 	}
-	if _, err := db.Exec("INSERT INTO checks(monitor_id,status,latency_ms,error,checked_at) VALUES(?,?,?,?,?)", id, status, latency, message, now); err != nil {
+	if err := execRetry(db, "INSERT INTO checks(monitor_id,status,latency_ms,error,checked_at) VALUES(?,?,?,?,?)", id, status, latency, message, now); err != nil {
 		log.Printf("insert check %d: %v", id, err)
 	}
 	if status == "down" && previous != "down" {
@@ -678,7 +699,7 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 			log.Printf("read monitor %d name: %v", id, err)
 		}
 		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime DOWN: %s: %s", monitorName, message)) }()
-		if _, err := db.Exec("INSERT OR IGNORE INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)", id, now, message); err != nil {
+		if err := execRetry(db, "INSERT OR IGNORE INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)", id, now, message); err != nil {
 			log.Printf("open incident %d: %v", id, err)
 		}
 	}
@@ -688,11 +709,11 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 			log.Printf("read monitor %d name: %v", id, err)
 		}
 		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime RECOVERED: %s", monitorName)) }()
-		if _, err := db.Exec("UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL", now, id); err != nil {
+		if err := execRetry(db, "UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL", now, id); err != nil {
 			log.Printf("close incident %d: %v", id, err)
 		}
 	}
-	if _, err := db.Exec("UPDATE monitors SET current_status=?,last_latency_ms=?,last_error=?,checked_at=? WHERE id=?", status, latency, message, now, id); err != nil {
+	if err := execRetry(db, "UPDATE monitors SET current_status=?,last_latency_ms=?,last_error=?,checked_at=? WHERE id=?", status, latency, message, now, id); err != nil {
 		log.Printf("update monitor %d: %v", id, err)
 	}
 }
