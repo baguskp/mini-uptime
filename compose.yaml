@@ -11,3 +11,6 @@ services:
       - ./data:/app/data:Z
     environment:
       TZ: Asia/Jakarta
+      # Optional Telegram alerts:
+      # TELEGRAM_BOT_TOKEN: ""
+      # TELEGRAM_CHAT_ID: ""

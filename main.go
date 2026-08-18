@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
@@ -36,30 +37,56 @@ var sessions = struct {
 
 func main() {
 	dbPath := getenv("DATABASE_PATH", "/app/data/miniuptime.db")
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil { log.Fatal(err) }
-	db, err := sql.Open("sqlite", dbPath); if err != nil { log.Fatal(err) }; defer db.Close()
-	if err := migrate(db); err != nil { log.Fatal(err) }
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		log.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+	if err := migrate(db); err != nil {
+		log.Fatal(err)
+	}
 	go monitorLoop(db)
+	go retentionLoop(db)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /events", requireAuth(db, events))
+	mux.HandleFunc("GET /events", requireAuth(db, events(db)))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		if err := db.Ping(); err != nil { http.Error(w, "database unavailable", 503); return }
-		w.Header().Set("Content-Type", "application/json"); _, _ = w.Write([]byte(`{"status":"ok"}`))
+		if err := db.Ping(); err != nil {
+			http.Error(w, "database unavailable", 503)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	staticFS, _ := fs.Sub(assets, "web/static")
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) { if configured(db) { http.Redirect(w, r, "/login", 302) } else { http.Redirect(w, r, "/setup", 302) } })
-	mux.HandleFunc("GET /setup", setupPage(db)); mux.Handle("POST /setup", csrf(setupSubmit(db)))
-	mux.HandleFunc("GET /login", loginPage(db)); mux.Handle("POST /login", csrf(loginSubmit(db)))
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		if configured(db) {
+			http.Redirect(w, r, "/login", 302)
+		} else {
+			http.Redirect(w, r, "/setup", 302)
+		}
+	})
+	mux.HandleFunc("GET /setup", setupPage(db))
+	mux.Handle("POST /setup", csrf(setupSubmit(db)))
+	mux.HandleFunc("GET /login", loginPage(db))
+	mux.Handle("POST /login", csrf(loginSubmit(db)))
 	mux.Handle("POST /logout", csrf(requireAuth(db, logout(db))))
 	mux.HandleFunc("GET /dashboard", requireAuth(db, dashboard(db)))
+	mux.HandleFunc("GET /display", display(db))
+	mux.Handle("POST /display/unlock", csrf(displayUnlock(db)))
 	mux.HandleFunc("GET /groups", requireAuth(db, groupsPage(db)))
 	mux.Handle("POST /groups", csrf(requireAuth(db, groupCreate(db))))
 	mux.Handle("POST /groups/{id}/delete", csrf(requireAuth(db, groupDelete(db))))
 	mux.HandleFunc("GET /monitors", requireAuth(db, monitorsPage(db)))
 	mux.HandleFunc("GET /monitors/{id}", requireAuth(db, monitorDetail(db)))
 	mux.HandleFunc("GET /incidents", requireAuth(db, incidentsPage(db)))
+	mux.HandleFunc("GET /settings", requireAuth(db, settingsPage(db)))
+	mux.Handle("POST /settings", csrf(requireAuth(db, settingsSave(db))))
+	mux.Handle("POST /settings/test", csrf(requireAuth(db, settingsTest(db))))
 	mux.HandleFunc("GET /monitors/new", requireAuth(db, monitorForm))
 	mux.HandleFunc("GET /monitors/{id}/edit", requireAuth(db, monitorEditPage(db)))
 	mux.Handle("POST /monitors", csrf(requireAuth(db, monitorCreate(db))))
@@ -69,48 +96,785 @@ func main() {
 	mux.Handle("POST /monitors/{id}/delete", csrf(requireAuth(db, monitorDelete(db))))
 
 	server := &http.Server{Addr: ":" + getenv("PORT", "3000"), Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	go func() { log.Printf("MiniUptime listening on %s", server.Addr); if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) { log.Fatal(err) } }()
-	ctx, stop := signalContext(); defer stop(); <-ctx.Done()
-	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second); defer cancel(); _ = server.Shutdown(shutdown)
+	go func() {
+		log.Printf("MiniUptime listening on %s", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+	ctx, stop := signalContext()
+	defer stop()
+	<-ctx.Done()
+	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = server.Shutdown(shutdown)
 }
 
-func migrate(db *sql.DB) error { if _,err:=db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL, name TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('http','tcp','ping')), target TEXT NOT NULL, interval_seconds INTEGER NOT NULL DEFAULT 60, enabled INTEGER NOT NULL DEFAULT 1, current_status TEXT NOT NULL DEFAULT 'unknown', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, latency_ms INTEGER NOT NULL, error TEXT, checked_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT NOT NULL); INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);`);err!=nil{return err}; var hasGroup bool; rows,err:=db.Query("PRAGMA table_info(monitors)");if err!=nil{return err};defer rows.Close();for rows.Next(){var cid int;var name,typ string;var notnull,pk int;var def any;if err:=rows.Scan(&cid,&name,&typ,&notnull,&def,&pk);err!=nil{return err};if name=="group_id"{hasGroup=true}};if !hasGroup {if _,err=db.Exec("ALTER TABLE monitors ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL");err!=nil{return err}};for _,column:=range []string{"current_status TEXT NOT NULL DEFAULT 'unknown'","last_latency_ms INTEGER NOT NULL DEFAULT 0","last_error TEXT NOT NULL DEFAULT ''","checked_at TEXT"} {name:=strings.Split(column," ")[0];var exists bool;rows2,_:=db.Query("PRAGMA table_info(monitors)");for rows2.Next(){var cid int;var n,t string;var nn,pk int;var d any;_=rows2.Scan(&cid,&n,&t,&nn,&d,&pk);if n==name{exists=true}};rows2.Close();if !exists {if _,err=db.Exec("ALTER TABLE monitors ADD COLUMN "+column);err!=nil{return err}}};return nil }
-func configured(db *sql.DB) bool { var n int; return db.QueryRow("SELECT COUNT(*) FROM admins").Scan(&n) == nil && n > 0 }
-func setupPage(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { if configured(db) { http.Redirect(w, r, "/login", 302); return }; render(w, "setup.html", csrfData(w, r)) } }
-func setupSubmit(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { if configured(db) { http.Error(w, "already configured", 409); return }; u, p := strings.TrimSpace(r.FormValue("username")), r.FormValue("password"); if len(u) < 3 || len(p) < 12 { http.Error(w, "username minimum 3 characters; password minimum 12 characters", 400); return }; h, _ := hashPassword(p); if _, err := db.Exec("INSERT INTO admins(username,password_hash,created_at) VALUES(?,?,?)", u, h, time.Now().UTC().Format(time.RFC3339)); err != nil { http.Error(w, "unable to create administrator", 400); return }; http.Redirect(w, r, "/login", 303) } }
-func loginPage(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { if !configured(db) { http.Redirect(w, r, "/setup", 302); return }; render(w, "login.html", csrfData(w, r)) } }
-func loginSubmit(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { var h string; if db.QueryRow("SELECT password_hash FROM admins WHERE username=?", r.FormValue("username")).Scan(&h) != nil || !checkPassword(r.FormValue("password"), h) { http.Error(w, "invalid credentials", 401); return }; token := randomToken(); if _,err:=db.Exec("INSERT INTO sessions(token,admin_id,expires_at) SELECT ?,id,? FROM admins WHERE username=?",token,time.Now().Add(24*time.Hour).UTC().Format(time.RFC3339),r.FormValue("username")); err!=nil { http.Error(w,"unable to create session",500); return }; http.SetCookie(w, &http.Cookie{Name:"session", Value:token, Path:"/", HttpOnly:true, SameSite:http.SameSiteLaxMode, Secure:r.TLS != nil, MaxAge:86400}); http.Redirect(w, r, "/dashboard", 303) } }
-func requireAuth(db *sql.DB, next http.HandlerFunc) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { c, err := r.Cookie("session"); var expiry string; if err!=nil || db.QueryRow("SELECT expires_at FROM sessions WHERE token=?",cookieValue(c,err)).Scan(&expiry)!=nil { http.Redirect(w,r,"/login",302); return }; if t,e:=time.Parse(time.RFC3339,expiry); e!=nil || time.Now().After(t) { http.Redirect(w,r,"/login",302); return }; next(w,r) } }
-func logout(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { if c, err := r.Cookie("session"); err == nil { _,_=db.Exec("DELETE FROM sessions WHERE token=?",c.Value) }; http.SetCookie(w, &http.Cookie{Name:"session", MaxAge:-1, Path:"/", HttpOnly:true}); http.Redirect(w, r, "/login", 303) } }
-func events(w http.ResponseWriter, r *http.Request) { flusher,ok:=w.(http.Flusher);if !ok{http.Error(w,"stream unsupported",500);return};w.Header().Set("Content-Type","text/event-stream");w.Header().Set("Cache-Control","no-cache");w.Header().Set("Connection","keep-alive");ticker:=time.NewTicker(5*time.Second);defer ticker.Stop();for {select{case <-r.Context().Done():return;case <-ticker.C:fmt.Fprint(w,"event: status\\ndata: update\\n\\n");flusher.Flush()}} }
-func dashboard(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { var total,up,down int; _=db.QueryRow("SELECT COUNT(*) FROM monitors").Scan(&total); _=db.QueryRow("SELECT COUNT(*) FROM monitors WHERE current_status='up'").Scan(&up); _=db.QueryRow("SELECT COUNT(*) FROM monitors WHERE current_status='down'").Scan(&down); rows,_:=db.Query("SELECT id,name,type,target,current_status,last_latency_ms FROM monitors ORDER BY name"); if rows==nil { http.Error(w,"unable to load monitors",500); return }; defer rows.Close();var monitors []map[string]any;for rows.Next(){var id,lat int;var name,typ,target,status string;_=rows.Scan(&id,&name,&typ,&target,&status,&lat);var checks,success int; _=db.QueryRow("SELECT COUNT(*),COALESCE(SUM(status='up'),0) FROM checks WHERE monitor_id=?",id).Scan(&checks,&success); uptime:=0;if checks>0{uptime=success*100/checks};monitors=append(monitors,map[string]any{"ID":id,"Name":name,"Type":typ,"Target":target,"Status":status,"Latency":lat,"Uptime":uptime})};ir,_:=db.Query("SELECT m.name,i.started_at,COALESCE(i.ended_at,'') FROM incidents i JOIN monitors m ON m.id=i.monitor_id ORDER BY i.id DESC LIMIT 5");defer ir.Close();var incidents []map[string]string;for ir.Next(){var name,started,ended string;_=ir.Scan(&name,&started,&ended);incidents=append(incidents,map[string]string{"Name":name,"Started":started,"Ended":ended})};render(w, "dashboard.html", map[string]any{"CSRF":csrfData(w,r)["CSRF"],"Total":total,"Up":up,"Down":down,"Monitors":monitors,"Incidents":incidents}) } }
-type group struct { ID int; Name string; CSRF string }
-func groupsPage(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { rows,err:=db.Query("SELECT id,name FROM groups ORDER BY name"); if err!=nil {http.Error(w,err.Error(),500);return}; defer rows.Close(); var list []group; for rows.Next(){var g group; if err:=rows.Scan(&g.ID,&g.Name);err!=nil{http.Error(w,err.Error(),500);return};list=append(list,g)}; token:=csrfData(w,r)["CSRF"];for i:=range list{list[i].CSRF=token};render(w,"groups.html",map[string]any{"Groups":list,"CSRF":token}) } }
-func groupCreate(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { name:=strings.TrimSpace(r.FormValue("name"));if name==""{http.Error(w,"name required",400);return};if _,err:=db.Exec("INSERT INTO groups(name,created_at) VALUES(?,?)",name,time.Now().UTC().Format(time.RFC3339));err!=nil{http.Error(w,"group already exists",409);return};http.Redirect(w,r,"/groups",303) } }
-func groupDelete(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) {if _,err:=db.Exec("DELETE FROM groups WHERE id=?",r.PathValue("id"));err!=nil{http.Error(w,err.Error(),500);return};http.Redirect(w,r,"/groups",303)} }
-type monitor struct { ID int; GroupID int; GroupName, Name, Type, Target string; Interval int; Enabled bool; CSRF string }
-func monitorsPage(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { rows, err := db.Query("SELECT m.id,COALESCE(m.group_id,0),COALESCE(g.name,''),m.name,m.type,m.target,m.interval_seconds,m.enabled FROM monitors m LEFT JOIN groups g ON g.id=m.group_id ORDER BY m.id DESC"); if err != nil { http.Error(w, err.Error(), 500); return }; defer rows.Close(); var list []monitor; for rows.Next() { var m monitor; var enabled int; if err := rows.Scan(&m.ID,&m.GroupID,&m.GroupName,&m.Name,&m.Type,&m.Target,&m.Interval,&enabled); err != nil { http.Error(w, err.Error(), 500); return }; m.Enabled=enabled == 1; list=append(list,m) }; token := csrfData(w, r)["CSRF"]; for i := range list { list[i].CSRF = token }; render(w,"monitors.html",list) } }
-func monitorForm(w http.ResponseWriter, r *http.Request) { render(w,"monitor-form.html",csrfData(w, r)) }
-func monitorEditPage(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter, r *http.Request) { var m monitor; var enabled int; if err:=db.QueryRow("SELECT id,COALESCE(group_id,0),name,type,target,interval_seconds,enabled FROM monitors WHERE id=?",r.PathValue("id")).Scan(&m.ID,&m.GroupID,&m.Name,&m.Type,&m.Target,&m.Interval,&enabled); err!=nil { http.NotFound(w,r); return }; m.Enabled=enabled==1; groups:=[]group{}; rows,_:=db.Query("SELECT id,name FROM groups ORDER BY name"); if rows!=nil { defer rows.Close(); for rows.Next(){var g group; _=rows.Scan(&g.ID,&g.Name); groups=append(groups,g)} }; data:=map[string]any{"Monitor":m,"Groups":groups,"CSRF":csrfData(w,r)["CSRF"]}; render(w,"monitor-edit.html",data) } }
-func monitorAssignGroup(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { groupID:=strings.TrimSpace(r.FormValue("group_id")); var err error; if groupID=="" { _,err=db.Exec("UPDATE monitors SET group_id=NULL WHERE id=?",r.PathValue("id")) } else { _,err=db.Exec("UPDATE monitors SET group_id=? WHERE id=?",groupID,r.PathValue("id")) }; if err!=nil {http.Error(w,err.Error(),400);return}; http.Redirect(w,r,"/monitors",303) } }
-func monitorUpdate(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { typ:=r.FormValue("type"); name,target:=strings.TrimSpace(r.FormValue("name")),strings.TrimSpace(r.FormValue("target")); interval:=60; if _, scanErr := fmt.Sscanf(r.FormValue("interval"), "%d", &interval); (typ!="http"&&typ!="tcp"&&typ!="ping") || name=="" || target=="" || scanErr!=nil || interval<10 { http.Error(w,"invalid monitor data",400); return }; groupID:=strings.TrimSpace(r.FormValue("group_id")); var err error; if groupID=="" { _,err=db.Exec("UPDATE monitors SET name=?,type=?,target=?,interval_seconds=?,group_id=NULL WHERE id=?",name,typ,target,interval,r.PathValue("id")) } else { _,err=db.Exec("UPDATE monitors SET name=?,type=?,target=?,interval_seconds=?,group_id=? WHERE id=?",name,typ,target,interval,groupID,r.PathValue("id")) }; if err!=nil {http.Error(w,err.Error(),500);return}; http.Redirect(w,r,"/monitors",303) } }
-func csrfData(w http.ResponseWriter, r *http.Request) map[string]string { token:=""; if c,err:=r.Cookie("csrf"); err==nil { token=c.Value }; if token=="" { token=randomToken(); http.SetCookie(w,&http.Cookie{Name:"csrf",Value:token,Path:"/",HttpOnly:true,SameSite:http.SameSiteLaxMode,Secure:r.TLS!=nil,MaxAge:3600}) }; return map[string]string{"CSRF":token} }
-func checkCSRF(r *http.Request) bool { c,err:=r.Cookie("csrf"); return err==nil && c.Value!="" && c.Value==r.FormValue("csrf") }
-func csrf(next http.HandlerFunc) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { if r.Method==http.MethodPost && !checkCSRF(r) { http.Error(w,"invalid csrf token",http.StatusForbidden); return }; next(w,r) } }
-func monitorLoop(db *sql.DB) { jobs:=make(chan monitorJob,32); for i:=0;i<4;i++ { go func(){ for job:=range jobs { runCheck(db,job.id,job.typ,job.target) } }() }; ticker:=time.NewTicker(5*time.Second); defer ticker.Stop(); for range ticker.C { rows,err:=db.Query("SELECT m.id,m.type,m.target,m.interval_seconds,COALESCE(MAX(c.checked_at),'') FROM monitors m LEFT JOIN checks c ON c.monitor_id=m.id WHERE m.enabled=1 GROUP BY m.id"); if err!=nil {continue}; now:=time.Now(); for rows.Next(){var id,interval int;var typ,target,last string;if rows.Scan(&id,&typ,&target,&interval,&last)!=nil{continue}; if last=="" {jobs<-monitorJob{id,typ,target};continue}; checked,e:=time.Parse(time.RFC3339,last);if e==nil&&now.Sub(checked)>=time.Duration(interval)*time.Second {jobs<-monitorJob{id,typ,target}} }; rows.Close() } }
-type monitorJob struct{id int;typ,target string}
-func runCheck(db *sql.DB,id int,typ,target string) { started:=time.Now(); var err error; for attempt:=0; attempt<3; attempt++ { err=checkTarget(typ,target); if err==nil || attempt==2 { break }; time.Sleep(time.Duration(attempt+1)*500*time.Millisecond) }; status,message:="up",""; if err!=nil { status="down"; message=err.Error() }; latency:=time.Since(started).Milliseconds(); now:=time.Now().UTC().Format(time.RFC3339); var previous string; _=db.QueryRow("SELECT current_status FROM monitors WHERE id=?",id).Scan(&previous); _,_=db.Exec("INSERT INTO checks(monitor_id,status,latency_ms,error,checked_at) VALUES(?,?,?,?,?)",id,status,latency,message,now); if status=="down" && previous!="down" { _,_=db.Exec("INSERT INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)",id,now,message) }; if status=="up" && previous=="down" { _,_=db.Exec("UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL",now,id) }; _,_=db.Exec("UPDATE monitors SET current_status=?,last_latency_ms=?,last_error=?,checked_at=? WHERE id=?",status,latency,message,now,id) }
-func checkTarget(typ, target string) error { ctx,cancel:=context.WithTimeout(context.Background(),10*time.Second); defer cancel(); switch typ { case "http": req,err:=http.NewRequestWithContext(ctx,http.MethodGet,target,nil); if err!=nil{return err}; resp,err:=http.DefaultClient.Do(req); if err==nil{defer resp.Body.Close();if resp.StatusCode>=400{return fmt.Errorf("HTTP %s",resp.Status)}};return err; case "tcp": conn,err:=net.DialTimeout("tcp",target,10*time.Second);if err==nil{conn.Close()};return err; case "ping":return exec.CommandContext(ctx,"ping","-c","1","-W","5",target).Run() };return fmt.Errorf("unknown monitor type") }
-func incidentsPage(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { rows,err:=db.Query("SELECT i.started_at,COALESCE(i.ended_at,''),m.name,i.error FROM incidents i JOIN monitors m ON m.id=i.monitor_id ORDER BY i.id DESC LIMIT 100");if err!=nil{http.Error(w,err.Error(),500);return};defer rows.Close();var incidents []map[string]string;for rows.Next(){var started,ended,name,e string;_=rows.Scan(&started,&ended,&name,&e);incidents=append(incidents,map[string]string{"Started":started,"Ended":ended,"Monitor":name,"Error":e})};render(w,"incidents.html",incidents) } }
-func monitorDetail(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { var m monitor; var enabled int; if err:=db.QueryRow("SELECT id,COALESCE(group_id,0),name,type,target,interval_seconds,enabled FROM monitors WHERE id=?",r.PathValue("id")).Scan(&m.ID,&m.GroupID,&m.Name,&m.Type,&m.Target,&m.Interval,&enabled);err!=nil{http.NotFound(w,r);return}; rows,err:=db.Query("SELECT status,latency_ms,COALESCE(error,''),checked_at FROM checks WHERE monitor_id=? ORDER BY id DESC LIMIT 50",m.ID);if err!=nil{http.Error(w,err.Error(),500);return};defer rows.Close();var checks []map[string]any;for rows.Next(){var s,e,at string;var l int;_=rows.Scan(&s,&l,&e,&at);checks=append(checks,map[string]any{"Status":s,"Latency":l,"Error":e,"At":at})};render(w,"monitor-detail.html",map[string]any{"Monitor":m,"Checks":checks}) } }
-func validMonitor(typ, name, target string, interval int) bool { target=strings.TrimSpace(target); if typ=="http" {u,e:=url.ParseRequestURI(target);if e!=nil||u.Scheme!="http"&&u.Scheme!="https"||u.Host==""{return false}} else if typ=="tcp" {if _,_,e:=net.SplitHostPort(target);e!=nil{return false}} else if typ=="ping" {if strings.Contains(target,"://")||target==""{return false}} else{return false};return strings.TrimSpace(name)!=""&&interval>=10 }
-func monitorCreate(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { typ:=r.FormValue("type"); if typ!="http" && typ!="tcp" && typ!="ping" { http.Error(w,"invalid monitor type",400); return }; name,target:=strings.TrimSpace(r.FormValue("name")),strings.TrimSpace(r.FormValue("target")); if name=="" || target=="" { http.Error(w,"name and target required",400); return }; interval:=60; if _,err:=fmt.Sscanf(r.FormValue("interval"),"%d",&interval);err!=nil || !validMonitor(typ,name,target,interval) { http.Error(w,"interval must be at least 10 seconds",400); return }; _,err:=db.Exec("INSERT INTO monitors(name,type,target,interval_seconds,created_at) VALUES(?,?,?,?,?)",name,typ,target,interval,time.Now().UTC().Format(time.RFC3339)); if err!=nil {http.Error(w,err.Error(),500);return}; http.Redirect(w,r,"/monitors",303) } }
-func monitorToggle(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { _,err:=db.Exec("UPDATE monitors SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?",r.PathValue("id")); if err!=nil {http.Error(w,err.Error(),500);return}; http.Redirect(w,r,"/monitors",303) } }
-func monitorDelete(db *sql.DB) http.HandlerFunc { return func(w http.ResponseWriter,r *http.Request) { _,err:=db.Exec("DELETE FROM monitors WHERE id=?",r.PathValue("id")); if err!=nil {http.Error(w,err.Error(),500);return}; http.Redirect(w,r,"/monitors",303) } }
-func render(w http.ResponseWriter, name string, data any) { t, err := template.ParseFS(assets, "web/templates/"+name); if err != nil { http.Error(w, err.Error(), 500); return }; _ = t.Execute(w, data) }
-func hashPassword(p string) (string, error) { salt:=make([]byte,16); if _,err:=rand.Read(salt);err!=nil{return "",err}; return fmt.Sprintf("$argon2id$v=19$m=65536,t=3,p=2$%x$%x",salt,argon2.IDKey([]byte(p),salt,3,64*1024,2,32)),nil }
-func checkPassword(p,h string) bool { var salt, expected []byte; if _,err:=fmt.Sscanf(h,"$argon2id$v=19$m=65536,t=3,p=2$%x$%x",&salt,&expected);err!=nil{return false}; got:=argon2.IDKey([]byte(p),salt,3,64*1024,2,32); return string(got)==string(expected) }
-func randomToken() string { b:=make([]byte,32); _,_=rand.Read(b); return fmt.Sprintf("%x",b) }
-func cookieValue(c *http.Cookie, err error) string { if err != nil { return "" }; return c.Value }
-func getenv(k,f string) string { if v:=os.Getenv(k);v!=""{return v};return f }
-func signalContext() (context.Context, context.CancelFunc) { return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM) }
+func migrate(db *sql.DB) error {
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL, name TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('http','tcp','ping')), target TEXT NOT NULL, interval_seconds INTEGER NOT NULL DEFAULT 60, enabled INTEGER NOT NULL DEFAULT 1, current_status TEXT NOT NULL DEFAULT 'unknown', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, latency_ms INTEGER NOT NULL, error TEXT, checked_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_checks_monitor_checked ON checks(monitor_id,checked_at); CREATE INDEX IF NOT EXISTS idx_incidents_monitor_ended ON incidents(monitor_id,ended_at); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at); INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);`); err != nil {
+		return err
+	}
+	var hasGroup bool
+	rows, err := db.Query("PRAGMA table_info(monitors)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var def any
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+			return err
+		}
+		if name == "group_id" {
+			hasGroup = true
+		}
+	}
+	if !hasGroup {
+		if _, err = db.Exec("ALTER TABLE monitors ADD COLUMN group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL"); err != nil {
+			return err
+		}
+	}
+	for _, column := range []string{"current_status TEXT NOT NULL DEFAULT 'unknown'", "last_latency_ms INTEGER NOT NULL DEFAULT 0", "last_error TEXT NOT NULL DEFAULT ''", "checked_at TEXT"} {
+		name := strings.Split(column, " ")[0]
+		var exists bool
+		rows2, _ := db.Query("PRAGMA table_info(monitors)")
+		for rows2.Next() {
+			var cid int
+			var n, t string
+			var nn, pk int
+			var d any
+			_ = rows2.Scan(&cid, &n, &t, &nn, &d, &pk)
+			if n == name {
+				exists = true
+			}
+		}
+		rows2.Close()
+		if !exists {
+			if _, err = db.Exec("ALTER TABLE monitors ADD COLUMN " + column); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+func configured(db *sql.DB) bool {
+	var n int
+	return db.QueryRow("SELECT COUNT(*) FROM admins").Scan(&n) == nil && n > 0
+}
+func setupPage(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if configured(db) {
+			http.Redirect(w, r, "/login", 302)
+			return
+		}
+		render(w, "setup.html", csrfData(w, r))
+	}
+}
+func setupSubmit(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if configured(db) {
+			http.Error(w, "already configured", 409)
+			return
+		}
+		u, p := strings.TrimSpace(r.FormValue("username")), r.FormValue("password")
+		if len(u) < 3 || len(p) < 12 {
+			http.Error(w, "username minimum 3 characters; password minimum 12 characters", 400)
+			return
+		}
+		h, _ := hashPassword(p)
+		if _, err := db.Exec("INSERT INTO admins(username,password_hash,created_at) VALUES(?,?,?)", u, h, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			http.Error(w, "unable to create administrator", 400)
+			return
+		}
+		http.Redirect(w, r, "/login", 303)
+	}
+}
+func loginPage(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !configured(db) {
+			http.Redirect(w, r, "/setup", 302)
+			return
+		}
+		render(w, "login.html", csrfData(w, r))
+	}
+}
+func loginSubmit(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var h string
+		if db.QueryRow("SELECT password_hash FROM admins WHERE username=?", r.FormValue("username")).Scan(&h) != nil || !checkPassword(r.FormValue("password"), h) {
+			http.Error(w, "invalid credentials", 401)
+			return
+		}
+		token := randomToken()
+		if _, err := db.Exec("INSERT INTO sessions(token,admin_id,expires_at) SELECT ?,id,? FROM admins WHERE username=?", token, time.Now().Add(24*time.Hour).UTC().Format(time.RFC3339), r.FormValue("username")); err != nil {
+			http.Error(w, "unable to create session", 500)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil, MaxAge: 86400})
+		http.Redirect(w, r, "/dashboard", 303)
+	}
+}
+func requireAuth(db *sql.DB, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie("session")
+		var expiry string
+		if err != nil || db.QueryRow("SELECT expires_at FROM sessions WHERE token=?", cookieValue(c, err)).Scan(&expiry) != nil {
+			http.Redirect(w, r, "/login", 302)
+			return
+		}
+		if t, e := time.Parse(time.RFC3339, expiry); e != nil || time.Now().After(t) {
+			http.Redirect(w, r, "/login", 302)
+			return
+		}
+		next(w, r)
+	}
+}
+func logout(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if c, err := r.Cookie("session"); err == nil {
+			_, _ = db.Exec("DELETE FROM sessions WHERE token=?", c.Value)
+		}
+		http.SetCookie(w, &http.Cookie{Name: "session", MaxAge: -1, Path: "/", HttpOnly: true})
+		http.Redirect(w, r, "/login", 303)
+	}
+}
+func events(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "stream unsupported", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+				rows, err := db.Query("SELECT id,current_status,last_latency_ms FROM monitors ORDER BY id")
+				if err != nil {
+					continue
+				}
+				var statuses []map[string]any
+				for rows.Next() {
+					var id, lat int
+					var status string
+					if rows.Scan(&id, &status, &lat) == nil {
+						statuses = append(statuses, map[string]any{"id": id, "status": status, "latency": lat})
+					}
+				}
+				rows.Close()
+				payload, _ := json.Marshal(statuses)
+				fmt.Fprintf(w, "event: status\\ndata: %s\\n\\n", payload)
+				flusher.Flush()
+			}
+		}
+	}
+}
+func display(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var mode string
+		db.QueryRow("SELECT value FROM settings WHERE key='display_mode'").Scan(&mode)
+		if mode == "disabled" || mode == "" {
+			http.NotFound(w, r)
+			return
+		}
+		if mode == "pin" {
+			c, e := r.Cookie("display_auth")
+			if e != nil || c.Value != "1" {
+				render(w, "display-pin.html", csrfData(w, r))
+				return
+			}
+		}
+		if mode != "public" && mode != "pin" {
+			http.NotFound(w, r)
+			return
+		}
+		groupName := strings.TrimSpace(r.URL.Query().Get("group"))
+		rows, _ := db.Query("SELECT m.id,m.name,m.type,m.target,m.current_status,m.last_latency_ms FROM monitors m LEFT JOIN groups g ON g.id=m.group_id WHERE m.enabled=1 AND (?='' OR g.name=?) ORDER BY m.name", groupName, groupName)
+		if rows == nil {
+			http.Error(w, "unable to load monitors", 500)
+			return
+		}
+		defer rows.Close()
+		var monitors []map[string]any
+		for rows.Next() {
+			var id, lat int
+			var name, typ, target, status string
+			if rows.Scan(&id, &name, &typ, &target, &status, &lat) == nil {
+				monitors = append(monitors, map[string]any{"ID": id, "Name": name, "Type": typ, "Target": target, "Status": status, "Latency": lat})
+			}
+		}
+		render(w, "display.html", map[string]any{"Monitors": monitors, "Group": groupName})
+	}
+}
+func dashboard(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var total, up, down int
+		_ = db.QueryRow("SELECT COUNT(*) FROM monitors").Scan(&total)
+		_ = db.QueryRow("SELECT COUNT(*) FROM monitors WHERE current_status='up'").Scan(&up)
+		_ = db.QueryRow("SELECT COUNT(*) FROM monitors WHERE current_status='down'").Scan(&down)
+		rows, _ := db.Query("SELECT id,name,type,target,current_status,last_latency_ms FROM monitors ORDER BY name")
+		if rows == nil {
+			http.Error(w, "unable to load monitors", 500)
+			return
+		}
+		defer rows.Close()
+		var monitors []map[string]any
+		for rows.Next() {
+			var id, lat int
+			var name, typ, target, status string
+			_ = rows.Scan(&id, &name, &typ, &target, &status, &lat)
+			var checks, success int
+			_ = db.QueryRow("SELECT COUNT(*),COALESCE(SUM(status='up'),0) FROM checks WHERE monitor_id=?", id).Scan(&checks, &success)
+			uptime := 0
+			if checks > 0 {
+				uptime = success * 100 / checks
+			}
+			monitors = append(monitors, map[string]any{"ID": id, "Name": name, "Type": typ, "Target": target, "Status": status, "Latency": lat, "Uptime": uptime})
+		}
+		ir, _ := db.Query("SELECT m.name,i.started_at,COALESCE(i.ended_at,'') FROM incidents i JOIN monitors m ON m.id=i.monitor_id ORDER BY i.id DESC LIMIT 5")
+		defer ir.Close()
+		var incidents []map[string]string
+		for ir.Next() {
+			var name, started, ended string
+			_ = ir.Scan(&name, &started, &ended)
+			incidents = append(incidents, map[string]string{"Name": name, "Started": started, "Ended": ended})
+		}
+		render(w, "dashboard.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "Total": total, "Up": up, "Down": down, "Monitors": monitors, "Incidents": incidents})
+	}
+}
+
+type group struct {
+	ID   int
+	Name string
+	CSRF string
+}
+
+func groupsPage(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rows, err := db.Query("SELECT g.id,g.name,COUNT(m.id) FROM groups g LEFT JOIN monitors m ON m.group_id=g.id GROUP BY g.id,g.name ORDER BY g.name")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer rows.Close()
+		var list []group
+		for rows.Next() {
+			var g group
+			var count int
+			if err := rows.Scan(&g.ID, &g.Name, &count); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			list = append(list, g)
+		}
+		token := csrfData(w, r)["CSRF"]
+		for i := range list {
+			list[i].CSRF = token
+		}
+		render(w, "groups.html", map[string]any{"Groups": list, "CSRF": token})
+	}
+}
+func groupCreate(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimSpace(r.FormValue("name"))
+		if name == "" {
+			http.Error(w, "name required", 400)
+			return
+		}
+		if _, err := db.Exec("INSERT INTO groups(name,created_at) VALUES(?,?)", name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+			http.Error(w, "group already exists", 409)
+			return
+		}
+		http.Redirect(w, r, "/groups", 303)
+	}
+}
+func groupDelete(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, err := db.Exec("DELETE FROM groups WHERE id=?", r.PathValue("id")); err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		http.Redirect(w, r, "/groups", 303)
+	}
+}
+
+type monitor struct {
+	ID                            int
+	GroupID                       int
+	GroupName, Name, Type, Target string
+	Interval                      int
+	Enabled                       bool
+	CSRF                          string
+}
+
+func monitorsPage(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		rows, err := db.Query("SELECT m.id,COALESCE(m.group_id,0),COALESCE(g.name,''),m.name,m.type,m.target,m.interval_seconds,m.enabled FROM monitors m LEFT JOIN groups g ON g.id=m.group_id WHERE m.name LIKE ? OR m.target LIKE ? ORDER BY m.id DESC", "%"+q+"%", "%"+q+"%")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer rows.Close()
+		var list []monitor
+		for rows.Next() {
+			var m monitor
+			var enabled int
+			if err := rows.Scan(&m.ID, &m.GroupID, &m.GroupName, &m.Name, &m.Type, &m.Target, &m.Interval, &enabled); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			m.Enabled = enabled == 1
+			list = append(list, m)
+		}
+		token := csrfData(w, r)["CSRF"]
+		for i := range list {
+			list[i].CSRF = token
+		}
+		render(w, "monitors.html", map[string]any{"Monitors": list, "Query": q, "CSRF": token})
+	}
+}
+func monitorForm(w http.ResponseWriter, r *http.Request) {
+	render(w, "monitor-form.html", csrfData(w, r))
+}
+func monitorEditPage(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var m monitor
+		var enabled int
+		if err := db.QueryRow("SELECT id,COALESCE(group_id,0),name,type,target,interval_seconds,enabled FROM monitors WHERE id=?", r.PathValue("id")).Scan(&m.ID, &m.GroupID, &m.Name, &m.Type, &m.Target, &m.Interval, &enabled); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		m.Enabled = enabled == 1
+		groups := []group{}
+		rows, _ := db.Query("SELECT id,name FROM groups ORDER BY name")
+		if rows != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var g group
+				_ = rows.Scan(&g.ID, &g.Name)
+				groups = append(groups, g)
+			}
+		}
+		data := map[string]any{"Monitor": m, "Groups": groups, "CSRF": csrfData(w, r)["CSRF"]}
+		render(w, "monitor-edit.html", data)
+	}
+}
+func monitorAssignGroup(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		groupID := strings.TrimSpace(r.FormValue("group_id"))
+		var err error
+		if groupID == "" {
+			_, err = db.Exec("UPDATE monitors SET group_id=NULL WHERE id=?", r.PathValue("id"))
+		} else {
+			_, err = db.Exec("UPDATE monitors SET group_id=? WHERE id=?", groupID, r.PathValue("id"))
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		http.Redirect(w, r, "/monitors", 303)
+	}
+}
+func monitorUpdate(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		typ := r.FormValue("type")
+		name, target := strings.TrimSpace(r.FormValue("name")), strings.TrimSpace(r.FormValue("target"))
+		interval := 60
+		if _, scanErr := fmt.Sscanf(r.FormValue("interval"), "%d", &interval); (typ != "http" && typ != "tcp" && typ != "ping") || name == "" || target == "" || scanErr != nil || interval < 10 {
+			http.Error(w, "invalid monitor data", 400)
+			return
+		}
+		groupID := strings.TrimSpace(r.FormValue("group_id"))
+		var err error
+		if groupID == "" {
+			_, err = db.Exec("UPDATE monitors SET name=?,type=?,target=?,interval_seconds=?,group_id=NULL WHERE id=?", name, typ, target, interval, r.PathValue("id"))
+		} else {
+			_, err = db.Exec("UPDATE monitors SET name=?,type=?,target=?,interval_seconds=?,group_id=? WHERE id=?", name, typ, target, interval, groupID, r.PathValue("id"))
+		}
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		http.Redirect(w, r, "/monitors", 303)
+	}
+}
+func csrfData(w http.ResponseWriter, r *http.Request) map[string]string {
+	token := ""
+	if c, err := r.Cookie("csrf"); err == nil {
+		token = c.Value
+	}
+	if token == "" {
+		token = randomToken()
+		http.SetCookie(w, &http.Cookie{Name: "csrf", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil, MaxAge: 3600})
+	}
+	return map[string]string{"CSRF": token}
+}
+func checkCSRF(r *http.Request) bool {
+	c, err := r.Cookie("csrf")
+	return err == nil && c.Value != "" && c.Value == r.FormValue("csrf")
+}
+func csrf(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && !checkCSRF(r) {
+			http.Error(w, "invalid csrf token", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+func retentionLoop(db *sql.DB) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		cleanupRetention(db)
+		<-ticker.C
+	}
+}
+func cleanupRetention(db *sql.DB) {
+	cutoff := time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC3339)
+	_, _ = db.Exec("DELETE FROM checks WHERE checked_at < ?", cutoff)
+	_, _ = db.Exec("DELETE FROM sessions WHERE expires_at < ?", time.Now().UTC().Format(time.RFC3339))
+}
+func monitorLoop(db *sql.DB) {
+	jobs := make(chan monitorJob, 32)
+	for i := 0; i < 4; i++ {
+		go func() {
+			for job := range jobs {
+				runCheck(db, job.id, job.typ, job.target)
+			}
+		}()
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		rows, err := db.Query("SELECT m.id,m.type,m.target,m.interval_seconds,COALESCE(MAX(c.checked_at),'') FROM monitors m LEFT JOIN checks c ON c.monitor_id=m.id WHERE m.enabled=1 GROUP BY m.id")
+		if err != nil {
+			continue
+		}
+		now := time.Now()
+		for rows.Next() {
+			var id, interval int
+			var typ, target, last string
+			if rows.Scan(&id, &typ, &target, &interval, &last) != nil {
+				continue
+			}
+			if last == "" {
+				jobs <- monitorJob{id, typ, target}
+				continue
+			}
+			checked, e := time.Parse(time.RFC3339, last)
+			if e == nil && now.Sub(checked) >= time.Duration(interval)*time.Second {
+				jobs <- monitorJob{id, typ, target}
+			}
+		}
+		rows.Close()
+	}
+}
+
+type monitorJob struct {
+	id          int
+	typ, target string
+}
+
+func runCheck(db *sql.DB, id int, typ, target string) {
+	started := time.Now()
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = checkTarget(typ, target)
+		if err == nil || attempt == 2 {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	}
+	status, message := "up", ""
+	if err != nil {
+		status = "down"
+		message = err.Error()
+	}
+	latency := time.Since(started).Milliseconds()
+	now := time.Now().UTC().Format(time.RFC3339)
+	var previous string
+	_ = db.QueryRow("SELECT current_status FROM monitors WHERE id=?", id).Scan(&previous)
+	_, _ = db.Exec("INSERT INTO checks(monitor_id,status,latency_ms,error,checked_at) VALUES(?,?,?,?,?)", id, status, latency, message, now)
+	if status == "down" && previous != "down" {
+		go telegramAlert(db, fmt.Sprintf("MiniUptime DOWN: monitor %d: %s", id, message))
+		_, _ = db.Exec("INSERT INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)", id, now, message)
+	}
+	if status == "up" && previous == "down" {
+		go telegramAlert(db, fmt.Sprintf("MiniUptime RECOVERED: monitor %d", id))
+		_, _ = db.Exec("UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL", now, id)
+	}
+	_, _ = db.Exec("UPDATE monitors SET current_status=?,last_latency_ms=?,last_error=?,checked_at=? WHERE id=?", status, latency, message, now, id)
+}
+func settingsPage(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var token, chat, mode string
+		db.QueryRow("SELECT value FROM settings WHERE key='telegram_token'").Scan(&token)
+		db.QueryRow("SELECT value FROM settings WHERE key='telegram_chat_id'").Scan(&chat)
+		db.QueryRow("SELECT value FROM settings WHERE key='display_mode'").Scan(&mode)
+		if mode == "" {
+			mode = "disabled"
+		}
+		render(w, "settings.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "TokenSet": token != "", "ChatID": chat, "DisplayMode": mode})
+	}
+}
+func settingsSave(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		mode := r.FormValue("display_mode")
+		if mode != "" {
+			if mode != "disabled" && mode != "public" && mode != "pin" {
+				http.Error(w, "invalid display mode", 400)
+				return
+			}
+			db.Exec("INSERT INTO settings(key,value) VALUES('display_mode',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", mode)
+			if mode == "pin" && len(r.FormValue("display_pin")) < 4 {
+				http.Error(w, "display PIN minimum 4 characters", 400)
+				return
+			}
+		}
+		if pin := strings.TrimSpace(r.FormValue("display_pin")); pin != "" {
+			db.Exec("INSERT INTO settings(key,value) VALUES('display_pin',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", pin)
+		}
+		for _, v := range []struct{ k, n string }{{"telegram_token", "token"}, {"telegram_chat_id", "chat_id"}} {
+			if _, e := db.Exec("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", v.k, strings.TrimSpace(r.FormValue(v.n))); e != nil {
+				http.Error(w, e.Error(), 500)
+				return
+			}
+		}
+		http.Redirect(w, r, "/settings", 303)
+	}
+}
+func displayUnlock(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var pin string
+		db.QueryRow("SELECT value FROM settings WHERE key='display_pin'").Scan(&pin)
+		if pin == "" || r.FormValue("pin") != pin {
+			http.Error(w, "invalid display PIN", 401)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{Name: "display_auth", Value: "1", Path: "/display", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 86400})
+		http.Redirect(w, r, "/display", 303)
+	}
+}
+func settingsTest(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		telegramAlert(db, "MiniUptime test alert")
+		http.Redirect(w, r, "/settings", 303)
+	}
+}
+func telegramAlert(db *sql.DB, message string) {
+	var token, chatID string
+	db.QueryRow("SELECT value FROM settings WHERE key='telegram_token'").Scan(&token)
+	db.QueryRow("SELECT value FROM settings WHERE key='telegram_chat_id'").Scan(&chatID)
+	if token == "" {
+		token = os.Getenv("TELEGRAM_BOT_TOKEN")
+	}
+	if chatID == "" {
+		chatID = os.Getenv("TELEGRAM_CHAT_ID")
+	}
+	if token == "" || chatID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	body := strings.NewReader(url.Values{"chat_id": {chatID}, "text": {message}}.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/sendMessage", body)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+func checkTarget(typ, target string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	switch typ {
+	case "http":
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				return fmt.Errorf("HTTP %s", resp.Status)
+			}
+		}
+		return err
+	case "tcp":
+		conn, err := net.DialTimeout("tcp", target, 10*time.Second)
+		if err == nil {
+			conn.Close()
+		}
+		return err
+	case "ping":
+		return exec.CommandContext(ctx, "ping", "-c", "1", "-W", "5", target).Run()
+	}
+	return fmt.Errorf("unknown monitor type")
+}
+func incidentsPage(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rows, err := db.Query("SELECT i.started_at,COALESCE(i.ended_at,''),m.name,i.error FROM incidents i JOIN monitors m ON m.id=i.monitor_id ORDER BY i.id DESC LIMIT 100")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer rows.Close()
+		var incidents []map[string]string
+		for rows.Next() {
+			var started, ended, name, e string
+			_ = rows.Scan(&started, &ended, &name, &e)
+			incidents = append(incidents, map[string]string{"Started": started, "Ended": ended, "Monitor": name, "Error": e})
+		}
+		render(w, "incidents.html", incidents)
+	}
+}
+func monitorDetail(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var m monitor
+		var enabled int
+		if err := db.QueryRow("SELECT id,COALESCE(group_id,0),name,type,target,interval_seconds,enabled FROM monitors WHERE id=?", r.PathValue("id")).Scan(&m.ID, &m.GroupID, &m.Name, &m.Type, &m.Target, &m.Interval, &enabled); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		rows, err := db.Query("SELECT status,latency_ms,COALESCE(error,''),checked_at FROM checks WHERE monitor_id=? ORDER BY id DESC LIMIT 50", m.ID)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer rows.Close()
+		var checks []map[string]any
+		maxLatency := 1
+		for rows.Next() {
+			var s, e, at string
+			var l int
+			_ = rows.Scan(&s, &l, &e, &at)
+			if l > maxLatency {
+				maxLatency = l
+			}
+			checks = append(checks, map[string]any{"Status": s, "Latency": l, "Error": e, "At": at})
+		}
+		for _, c := range checks {
+			c["Width"] = c["Latency"].(int) * 100 / maxLatency
+		}
+		render(w, "monitor-detail.html", map[string]any{"Monitor": m, "Checks": checks})
+	}
+}
+func validMonitor(typ, name, target string, interval int) bool {
+	target = strings.TrimSpace(target)
+	if typ == "http" {
+		u, e := url.ParseRequestURI(target)
+		if e != nil || u.Scheme != "http" && u.Scheme != "https" || u.Host == "" {
+			return false
+		}
+	} else if typ == "tcp" {
+		if _, _, e := net.SplitHostPort(target); e != nil {
+			return false
+		}
+	} else if typ == "ping" {
+		if strings.Contains(target, "://") || target == "" {
+			return false
+		}
+	} else {
+		return false
+	}
+	return strings.TrimSpace(name) != "" && interval >= 10
+}
+func monitorCreate(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		typ := r.FormValue("type")
+		if typ != "http" && typ != "tcp" && typ != "ping" {
+			http.Error(w, "invalid monitor type", 400)
+			return
+		}
+		name, target := strings.TrimSpace(r.FormValue("name")), strings.TrimSpace(r.FormValue("target"))
+		if name == "" || target == "" {
+			http.Error(w, "name and target required", 400)
+			return
+		}
+		interval := 60
+		if _, err := fmt.Sscanf(r.FormValue("interval"), "%d", &interval); err != nil || !validMonitor(typ, name, target, interval) {
+			http.Error(w, "interval must be at least 10 seconds", 400)
+			return
+		}
+		_, err := db.Exec("INSERT INTO monitors(name,type,target,interval_seconds,created_at) VALUES(?,?,?,?,?)", name, typ, target, interval, time.Now().UTC().Format(time.RFC3339))
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		http.Redirect(w, r, "/monitors", 303)
+	}
+}
+func monitorToggle(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, err := db.Exec("UPDATE monitors SET enabled=CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?", r.PathValue("id"))
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		http.Redirect(w, r, "/monitors", 303)
+	}
+}
+func monitorDelete(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, err := db.Exec("DELETE FROM monitors WHERE id=?", r.PathValue("id"))
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		http.Redirect(w, r, "/monitors", 303)
+	}
+}
+func render(w http.ResponseWriter, name string, data any) {
+	t, err := template.ParseFS(assets, "web/templates/"+name)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	_ = t.Execute(w, data)
+}
+func hashPassword(p string) (string, error) {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("$argon2id$v=19$m=65536,t=3,p=2$%x$%x", salt, argon2.IDKey([]byte(p), salt, 3, 64*1024, 2, 32)), nil
+}
+func checkPassword(p, h string) bool {
+	var salt, expected []byte
+	if _, err := fmt.Sscanf(h, "$argon2id$v=19$m=65536,t=3,p=2$%x$%x", &salt, &expected); err != nil {
+		return false
+	}
+	got := argon2.IDKey([]byte(p), salt, 3, 64*1024, 2, 32)
+	return string(got) == string(expected)
+}
+func randomToken() string { b := make([]byte, 32); _, _ = rand.Read(b); return fmt.Sprintf("%x", b) }
+func cookieValue(c *http.Cookie, err error) string {
+	if err != nil {
+		return ""
+	}
+	return c.Value
+}
+func getenv(k, f string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return f
+}
+func signalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}

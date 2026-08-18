@@ -86,12 +86,15 @@ fork/exec /usr/bin/ping: operation not permitted
 podman run --rm -v "$PWD:/src:Z" -w /src docker.io/library/golang:1.22 go test ./...
 ```
 
-- Phase 6 incomplete: monitor filtering, response graph, UI consistency on all pages.
-- Phase 7 SSE is minimal: sends `status` event every 5 sec; dashboard reloads. No payload/reconnect strategy.
-- Phase 8 Telegram not started.
-- Phase 9 Display mode/PIN not started. Do not confuse Display PIN with Ping.
+- Phase 6 complete: monitor filtering, response graph, and consistent UI applied to dashboard, monitors, groups, incidents, login, and monitor detail.
+- Phase 7 complete for current scope: SSE live status/latency updates without page reload.
+- Phase 7 SSE sends JSON status/latency payload every 5 sec; dashboard updates rows without reload. Browser reconnect remains native EventSource behavior; stream closes on error.
+- Phase 8 Telegram alerting added via optional `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` environment variables. Sends DOWN and RECOVERED alerts.
+- Phase 9 complete: `/display` supports Disabled, Public read-only, PIN protected modes, and optional group filtering via `?group=name`. PIN unlock uses scoped HttpOnly cookie; display remains read-only and SSE live.
 - Current Ping tests historically included bad target `https://google.com`; edit to `google.com` or IP.
-- Session persistence exists, but clean expired-session retention is not implemented.
+- Retention cleanup runs hourly: checks older than 30 days and expired sessions are deleted.
+- SQLite indexes added for check history, incident lookup, and session expiry cleanup.
+- Benchmark baseline: `validMonitor` 387.3 ns/op, 144 B/op, 1 allocs/op.
 - Current status update logic depends on existing DB migration columns.
 
 ## Next session order
@@ -100,8 +103,10 @@ podman run --rm -v "$PWD:/src:Z" -w /src docker.io/library/golang:1.22 go test .
 2. Run container test command above.
 3. Create first commit with meaningful message.
 4. Verify HTTP, TCP, Ping with correct targets.
-5. Finish Phase 6 filtering and response graph.
-6. Improve SSE payload only if needed.
+5. Run manual checks for login, CRUD, checks, SSE, `/display`, and responsive pages.
+6. Manually test display modes, PIN flow, and group filtering.
+7. Benchmark before further SQLite or scheduler tuning.
+8. Review benchmark output; avoid tuning without measured bottleneck.
 
 ## Do not
 

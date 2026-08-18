@@ -1,0 +1,6 @@
+data/
+.idea/
+*.db
+*.db-shm
+*.db-wal
+.env
