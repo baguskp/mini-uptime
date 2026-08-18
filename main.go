@@ -546,8 +546,12 @@ func retentionLoop(db *sql.DB) {
 }
 func cleanupRetention(db *sql.DB) {
 	cutoff := time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC3339)
-	_, _ = db.Exec("DELETE FROM checks WHERE checked_at < ?", cutoff)
-	_, _ = db.Exec("DELETE FROM sessions WHERE expires_at < ?", time.Now().UTC().Format(time.RFC3339))
+	if _, err := db.Exec("DELETE FROM checks WHERE checked_at < ?", cutoff); err != nil {
+		log.Printf("retention checks: %v", err)
+	}
+	if _, err := db.Exec("DELETE FROM sessions WHERE expires_at < ?", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		log.Printf("retention sessions: %v", err)
+	}
 }
 func monitorLoop(db *sql.DB) {
 	jobs := make(chan monitorJob, 32)
@@ -609,7 +613,9 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	var previous string
 	_ = db.QueryRow("SELECT current_status FROM monitors WHERE id=?", id).Scan(&previous)
-	_, _ = db.Exec("INSERT INTO checks(monitor_id,status,latency_ms,error,checked_at) VALUES(?,?,?,?,?)", id, status, latency, message, now)
+	if _, err := db.Exec("INSERT INTO checks(monitor_id,status,latency_ms,error,checked_at) VALUES(?,?,?,?,?)", id, status, latency, message, now); err != nil {
+		log.Printf("insert check %d: %v", id, err)
+	}
 	if status == "down" && previous != "down" {
 		var monitorName string
 		_ = db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName)
@@ -622,7 +628,9 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime RECOVERED: %s", monitorName)) }()
 		_, _ = db.Exec("UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL", now, id)
 	}
-	_, _ = db.Exec("UPDATE monitors SET current_status=?,last_latency_ms=?,last_error=?,checked_at=? WHERE id=?", status, latency, message, now, id)
+	if _, err := db.Exec("UPDATE monitors SET current_status=?,last_latency_ms=?,last_error=?,checked_at=? WHERE id=?", status, latency, message, now, id); err != nil {
+		log.Printf("update monitor %d: %v", id, err)
+	}
 }
 func settingsPage(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
