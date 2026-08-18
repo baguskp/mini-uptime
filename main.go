@@ -111,7 +111,7 @@ func main() {
 }
 
 func migrate(db *sql.DB) error {
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL, name TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('http','tcp','ping')), target TEXT NOT NULL, interval_seconds INTEGER NOT NULL DEFAULT 60, enabled INTEGER NOT NULL DEFAULT 1, current_status TEXT NOT NULL DEFAULT 'unknown', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, latency_ms INTEGER NOT NULL, error TEXT, checked_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_checks_monitor_checked ON checks(monitor_id,checked_at); CREATE INDEX IF NOT EXISTS idx_incidents_monitor_ended ON incidents(monitor_id,ended_at); CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at); INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);`); err != nil {
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL, name TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('http','tcp','ping')), target TEXT NOT NULL, interval_seconds INTEGER NOT NULL DEFAULT 60, enabled INTEGER NOT NULL DEFAULT 1, current_status TEXT NOT NULL DEFAULT 'unknown', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, latency_ms INTEGER NOT NULL, error TEXT, checked_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_checks_monitor_checked ON checks(monitor_id,checked_at); CREATE INDEX IF NOT EXISTS idx_incidents_monitor_ended ON incidents(monitor_id,ended_at); CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_one_open ON incidents(monitor_id) WHERE ended_at IS NULL; CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at); INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);`); err != nil {
 		return err
 	}
 	var hasGroup bool
@@ -607,11 +607,15 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 	_ = db.QueryRow("SELECT current_status FROM monitors WHERE id=?", id).Scan(&previous)
 	_, _ = db.Exec("INSERT INTO checks(monitor_id,status,latency_ms,error,checked_at) VALUES(?,?,?,?,?)", id, status, latency, message, now)
 	if status == "down" && previous != "down" {
-		go telegramAlert(db, fmt.Sprintf("MiniUptime DOWN: monitor %d: %s", id, message))
-		_, _ = db.Exec("INSERT INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)", id, now, message)
+		var monitorName string
+		_ = db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName)
+		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime DOWN: %s: %s", monitorName, message)) }()
+		_, _ = db.Exec("INSERT OR IGNORE INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)", id, now, message)
 	}
 	if status == "up" && previous == "down" {
-		go telegramAlert(db, fmt.Sprintf("MiniUptime RECOVERED: monitor %d", id))
+		var monitorName string
+		_ = db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName)
+		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime RECOVERED: %s", monitorName)) }()
 		_, _ = db.Exec("UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL", now, id)
 	}
 	_, _ = db.Exec("UPDATE monitors SET current_status=?,last_latency_ms=?,last_error=?,checked_at=? WHERE id=?", status, latency, message, now, id)
@@ -625,7 +629,7 @@ func settingsPage(db *sql.DB) http.HandlerFunc {
 		if mode == "" {
 			mode = "disabled"
 		}
-		render(w, "settings.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "TokenSet": token != "", "ChatID": chat, "DisplayMode": mode})
+		render(w, "settings.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "TokenSet": token != "", "ChatID": chat, "DisplayMode": mode, "TelegramSent": r.URL.Query().Get("telegram_sent") == "1", "TelegramError": r.URL.Query().Get("telegram_error")})
 	}
 }
 func settingsSave(db *sql.DB) http.HandlerFunc {
@@ -668,11 +672,14 @@ func displayUnlock(db *sql.DB) http.HandlerFunc {
 }
 func settingsTest(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		telegramAlert(db, "MiniUptime test alert")
-		http.Redirect(w, r, "/settings", 303)
+		if err := telegramAlert(db, "MiniUptime test alert"); err != nil {
+			http.Redirect(w, r, "/settings?telegram_error="+url.QueryEscape(err.Error()), 303)
+			return
+		}
+		http.Redirect(w, r, "/settings?telegram_sent=1", 303)
 	}
 }
-func telegramAlert(db *sql.DB, message string) {
+func telegramAlert(db *sql.DB, message string) error {
 	var token, chatID string
 	db.QueryRow("SELECT value FROM settings WHERE key='telegram_token'").Scan(&token)
 	db.QueryRow("SELECT value FROM settings WHERE key='telegram_chat_id'").Scan(&chatID)
@@ -683,20 +690,25 @@ func telegramAlert(db *sql.DB, message string) {
 		chatID = os.Getenv("TELEGRAM_CHAT_ID")
 	}
 	if token == "" || chatID == "" {
-		return
+		return errors.New("Telegram is not configured")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	body := strings.NewReader(url.Values{"chat_id": {chatID}, "text": {message}}.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/sendMessage", body)
 	if err != nil {
-		return
+		return err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := http.DefaultClient.Do(req)
-	if err == nil {
-		resp.Body.Close()
+	if err != nil {
+		return err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("Telegram returned %s", resp.Status)
+	}
+	return nil
 }
 func checkTarget(typ, target string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

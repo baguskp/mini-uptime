@@ -89,7 +89,7 @@ podman run --rm -v "$PWD:/src:Z" -w /src docker.io/library/golang:1.22 go test .
 - Phase 6 complete: monitor filtering, response graph, and consistent UI applied to dashboard, monitors, groups, incidents, login, and monitor detail.
 - Phase 7 complete for current scope: SSE live status/latency updates without page reload.
 - Phase 7 SSE sends JSON status/latency payload every 5 sec; dashboard updates rows without reload. Browser reconnect remains native EventSource behavior; stream closes on error.
-- Phase 8 Telegram alerting added via optional `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` environment variables. Sends DOWN and RECOVERED alerts.
+- Phase 8 Telegram alerting added via optional `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` environment variables. Sends DOWN and RECOVERED alerts with monitor name; test result appears in UI; open incidents deduplicated by SQLite partial unique index.
 - Phase 9 complete: `/display` supports Disabled, Public read-only, PIN protected modes, and optional group filtering via `?group=name`. PIN unlock uses scoped HttpOnly cookie; display remains read-only and SSE live.
 - Current Ping tests historically included bad target `https://google.com`; edit to `google.com` or IP.
 - Retention cleanup runs hourly: checks older than 30 days and expired sessions are deleted.
