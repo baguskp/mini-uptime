@@ -187,3 +187,21 @@ MiniUptime is intended to be deployed behind a trusted network boundary or a pro
 ## Status
 
 MiniUptime is an actively developed lightweight monitoring project. The core monitoring, dashboard, group management, incident tracking, Telegram alerting, and display workflows are implemented and covered by automated tests.
+
+# Agent Ingest
+
+`pc-health-agent` dapat mengirim heartbeat ke MiniUptime:
+
+```text
+POST /api/agent/health
+Authorization: Bearer <AGENT_INGEST_TOKEN>
+Content-Type: application/json
+```
+
+Daftarkan PC melalui halaman `/agents` untuk menghasilkan token unik. Token global
+`AGENT_INGEST_TOKEN` tetap dapat dipakai sebagai fallback. Interval default untuk
+status agent adalah 60 detik; status dianggap offline setelah `3 x` interval.
+Interval dapat diubah dengan `AGENT_HEARTBEAT_INTERVAL`, misalnya `5m`.
+
+Payload mengikuti payload health agent yang sudah ada. MiniUptime menyimpan satu
+row per hostname pada tabel `agents` dan tidak memperlakukan agent sebagai monitor.

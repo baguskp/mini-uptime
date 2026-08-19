@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -76,6 +79,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.HandleFunc("POST /api/agent/health", agentHealth(db))
 	staticFS, _ := fs.Sub(assets, "web/static")
 	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
@@ -99,6 +103,11 @@ func main() {
 	mux.Handle("POST /groups/{id}/delete", csrf(requireAuth(db, groupDelete(db))))
 	mux.HandleFunc("GET /monitors", requireAuth(db, monitorsPage(db)))
 	mux.HandleFunc("GET /monitors/{id}", requireAuth(db, monitorDetail(db)))
+	mux.HandleFunc("GET /agents", requireAuth(db, agentsPage(db)))
+	mux.HandleFunc("GET /agents/new", requireAuth(db, agentForm(db)))
+	mux.Handle("POST /agents", csrf(requireAuth(db, agentCreate(db))))
+	mux.Handle("POST /agents/{id}/delete", csrf(requireAuth(db, agentDelete(db))))
+	mux.HandleFunc("GET /agents/{id}", requireAuth(db, agentDetail(db)))
 	mux.HandleFunc("GET /incidents", requireAuth(db, incidentsPage(db)))
 	mux.HandleFunc("GET /settings", requireAuth(db, settingsPage(db)))
 	mux.Handle("POST /settings", csrf(requireAuth(db, settingsSave(db))))
@@ -127,7 +136,7 @@ func main() {
 }
 
 func migrate(db *sql.DB) error {
-	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL, name TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('http','tcp','ping')), target TEXT NOT NULL, interval_seconds INTEGER NOT NULL DEFAULT 60, enabled INTEGER NOT NULL DEFAULT 1, current_status TEXT NOT NULL DEFAULT 'unknown', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, latency_ms INTEGER NOT NULL, error TEXT, checked_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_checks_monitor_checked ON checks(monitor_id,checked_at); CREATE INDEX IF NOT EXISTS idx_incidents_monitor_ended ON incidents(monitor_id,ended_at); CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_one_open ON incidents(monitor_id) WHERE ended_at IS NULL; CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at); INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);`); err != nil {
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS groups(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS monitors(id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL, name TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('http','tcp','ping')), target TEXT NOT NULL, interval_seconds INTEGER NOT NULL DEFAULT 60, enabled INTEGER NOT NULL DEFAULT 1, current_status TEXT NOT NULL DEFAULT 'unknown', last_latency_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', checked_at TEXT, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, admin_id INTEGER NOT NULL, expires_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS checks(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, status TEXT NOT NULL, latency_ms INTEGER NOT NULL, error TEXT, checked_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY, monitor_id INTEGER NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, error TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS agents(id INTEGER PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', hostname TEXT UNIQUE NOT NULL, token_hash TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'offline', heartbeat_at TEXT NOT NULL, collected_at TEXT NOT NULL, primary_ip TEXT NOT NULL DEFAULT '', os TEXT NOT NULL, architecture TEXT NOT NULL, cpus INTEGER NOT NULL, memory_total_bytes INTEGER NOT NULL, memory_available_bytes INTEGER NOT NULL, disk_path TEXT NOT NULL DEFAULT '', disk_total_bytes INTEGER NOT NULL, disk_available_bytes INTEGER NOT NULL, internet_ping_ms REAL, gateway_ip TEXT NOT NULL DEFAULT '', gateway_ping_ms REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS idx_agents_heartbeat ON agents(heartbeat_at); CREATE INDEX IF NOT EXISTS idx_checks_monitor_checked ON checks(monitor_id,checked_at); CREATE INDEX IF NOT EXISTS idx_incidents_monitor_ended ON incidents(monitor_id,ended_at); CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_one_open ON incidents(monitor_id) WHERE ended_at IS NULL; CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at); INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);`); err != nil {
 		return err
 	}
 	var hasGroup bool
@@ -174,8 +183,332 @@ func migrate(db *sql.DB) error {
 			}
 		}
 	}
+	var hasAgentDisplayName bool
+	agentColumns, err := db.Query("PRAGMA table_info(agents)")
+	if err != nil {
+		return err
+	}
+	for agentColumns.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var def any
+		if err := agentColumns.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+			agentColumns.Close()
+			return err
+		}
+		if name == "display_name" {
+			hasAgentDisplayName = true
+		}
+	}
+	agentColumns.Close()
+	if !hasAgentDisplayName {
+		if _, err := db.Exec("ALTER TABLE agents ADD COLUMN display_name TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	if _, err := db.Exec("UPDATE agents SET display_name=hostname WHERE display_name='' AND hostname<>''"); err != nil {
+		return err
+	}
 	return nil
 }
+
+type agentHealthPayload struct {
+	Hostname     string           `json:"hostname"`
+	PrimaryIP    string           `json:"primary_ip"`
+	Interfaces   []agentInterface `json:"interfaces"`
+	OS           string           `json:"os"`
+	Architecture string           `json:"architecture"`
+	CPUs         int              `json:"cpus"`
+	Memory       agentMemory      `json:"memory"`
+	Disk         agentDisk        `json:"disk"`
+	InternetPing *float64         `json:"internet_ping_ms"`
+	GatewayIP    string           `json:"gateway_ip"`
+	GatewayPing  *float64         `json:"gateway_ping_ms"`
+	CollectedAt  string           `json:"collected_at"`
+}
+
+type agentInterface struct {
+	Name   string `json:"name"`
+	Type   string `json:"type"`
+	IP     string `json:"ip"`
+	Status string `json:"status"`
+}
+
+type agentMemory struct {
+	TotalBytes     uint64 `json:"total_bytes"`
+	AvailableBytes uint64 `json:"available_bytes"`
+}
+
+type agentDisk struct {
+	Path           string `json:"path"`
+	TotalBytes     uint64 `json:"total_bytes"`
+	AvailableBytes uint64 `json:"available_bytes"`
+}
+
+// agentHealth memvalidasi heartbeat agent dan menyimpan snapshot health terakhirnya.
+func agentHealth(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		providedHash := sha256.Sum256([]byte(token))
+		var registeredID int
+		tokenHash := fmt.Sprintf("%x", providedHash)
+		registered := token != "" && db.QueryRow("SELECT id FROM agents WHERE token_hash=?", tokenHash).Scan(&registeredID) == nil
+		expected := strings.TrimSpace(os.Getenv("AGENT_INGEST_TOKEN"))
+		globalHash := sha256.Sum256([]byte(expected))
+		global := expected != "" && token != "" && subtle.ConstantTimeCompare(globalHash[:], providedHash[:]) == 1
+		if !registered && !global {
+			http.Error(w, "invalid bearer token", http.StatusUnauthorized)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var payload agentHealthPayload
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil || !validAgentHealth(payload) {
+			http.Error(w, "invalid health payload", http.StatusUnprocessableEntity)
+			return
+		}
+
+		now := time.Now().UTC()
+		values := []any{payload.Hostname, tokenHash, "online", now.Format(time.RFC3339), payload.CollectedAt, payload.PrimaryIP, payload.OS, payload.Architecture, payload.CPUs, payload.Memory.TotalBytes, payload.Memory.AvailableBytes, payload.Disk.Path, payload.Disk.TotalBytes, payload.Disk.AvailableBytes, payload.InternetPing, payload.GatewayIP, payload.GatewayPing, now.Format(time.RFC3339), now.Format(time.RFC3339)}
+		var err error
+		if registered {
+			// Token registration owns the row; hostname dari payload boleh berbeda dari label awal.
+			_, _ = db.Exec("DELETE FROM agents WHERE hostname=? AND id<>? AND token_hash=?", payload.Hostname, registeredID, tokenHash)
+			updateValues := append([]any{}, values[:17]...)
+			updateValues = append(updateValues, values[18], registeredID)
+			_, err = db.Exec(`UPDATE agents SET hostname=?,token_hash=?,status=?,heartbeat_at=?,collected_at=?,primary_ip=?,os=?,architecture=?,cpus=?,memory_total_bytes=?,memory_available_bytes=?,disk_path=?,disk_total_bytes=?,disk_available_bytes=?,internet_ping_ms=?,gateway_ip=?,gateway_ping_ms=?,updated_at=? WHERE id=?`, updateValues...)
+		} else {
+			_, err = db.Exec(`INSERT INTO agents(hostname,token_hash,status,heartbeat_at,collected_at,primary_ip,os,architecture,cpus,memory_total_bytes,memory_available_bytes,disk_path,disk_total_bytes,disk_available_bytes,internet_ping_ms,gateway_ip,gateway_ping_ms,created_at,updated_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+				ON CONFLICT(hostname) DO UPDATE SET token_hash=excluded.token_hash,status=excluded.status,heartbeat_at=excluded.heartbeat_at,collected_at=excluded.collected_at,primary_ip=excluded.primary_ip,os=excluded.os,architecture=excluded.architecture,cpus=excluded.cpus,memory_total_bytes=excluded.memory_total_bytes,memory_available_bytes=excluded.memory_available_bytes,disk_path=excluded.disk_path,disk_total_bytes=excluded.disk_total_bytes,disk_available_bytes=excluded.disk_available_bytes,internet_ping_ms=excluded.internet_ping_ms,gateway_ip=excluded.gateway_ip,gateway_ping_ms=excluded.gateway_ping_ms,updated_at=excluded.updated_at`, values...)
+		}
+		if err != nil {
+			http.Error(w, "unable to store health", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
+	}
+}
+
+type agentView struct {
+	ID              int
+	DisplayName     string
+	Hostname        string
+	Status          string
+	Online          bool
+	Heartbeat       string
+	Collected       string
+	PrimaryIP       string
+	OS              string
+	Architecture    string
+	CPUs            int
+	MemoryTotal     string
+	MemoryAvailable string
+	DiskPath        string
+	DiskTotal       string
+	DiskAvailable   string
+	InternetPing    string
+	GatewayIP       string
+	GatewayPing     string
+}
+
+// agentsPage menampilkan ringkasan status seluruh PC yang terdaftar.
+func agentsPage(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rows, err := db.Query("SELECT id,display_name,hostname,status,heartbeat_at,collected_at,primary_ip,os,architecture,cpus,memory_total_bytes,memory_available_bytes,disk_path,disk_total_bytes,disk_available_bytes,internet_ping_ms,gateway_ip,gateway_ping_ms FROM agents ORDER BY display_name,hostname")
+		if err != nil {
+			http.Error(w, "unable to load agents", 500)
+			return
+		}
+		defer rows.Close()
+		list := []agentView{}
+		for rows.Next() {
+			view, err := scanAgent(rows, time.Now().UTC())
+			if err != nil {
+				http.Error(w, "unable to read agents", 500)
+				return
+			}
+			list = append(list, view)
+		}
+		total, online, offline := agentCounts(db)
+		render(w, "agents.html", map[string]any{"Agents": list, "CSRF": csrfData(w, r)["CSRF"], "Total": total, "Online": online, "Offline": offline})
+	}
+}
+
+// agentDetail menampilkan metrik terakhir yang dikirim oleh satu agent.
+func agentDetail(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id < 1 {
+			http.Error(w, "invalid agent", 400)
+			return
+		}
+		row := db.QueryRow("SELECT id,display_name,hostname,status,heartbeat_at,collected_at,primary_ip,os,architecture,cpus,memory_total_bytes,memory_available_bytes,disk_path,disk_total_bytes,disk_available_bytes,internet_ping_ms,gateway_ip,gateway_ping_ms FROM agents WHERE id=?", id)
+		view, err := scanAgent(row, time.Now().UTC())
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, "unable to read agent", 500)
+			return
+		}
+		render(w, "agent-detail.html", map[string]any{"Agent": view, "CSRF": csrfData(w, r)["CSRF"]})
+	}
+}
+
+// agentForm menampilkan formulir pendaftaran dan instruksi pemasangan agent.
+func agentForm(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		render(w, "agent-form.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"]})
+	}
+}
+
+// agentCreate mendaftarkan nama tampilan dan menghasilkan token yang hanya ditampilkan sekali.
+func agentCreate(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		displayName := strings.TrimSpace(r.FormValue("display_name"))
+		if displayName == "" || len(displayName) > 255 {
+			http.Error(w, "agent name required and must be 255 characters or fewer", 400)
+			return
+		}
+		token := randomToken()
+		now := time.Now().UTC().Format(time.RFC3339)
+		_, err := db.Exec("INSERT INTO agents(display_name,hostname,token_hash,status,heartbeat_at,collected_at,primary_ip,os,architecture,cpus,memory_total_bytes,memory_available_bytes,disk_path,disk_total_bytes,disk_available_bytes,gateway_ip,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", displayName, displayName, fmt.Sprintf("%x", sha256.Sum256([]byte(token))), "offline", "", "", "", "", "", 0, 0, 0, "", 0, 0, "", now, now)
+		if err != nil {
+			http.Error(w, "agent hostname already exists", 409)
+			return
+		}
+		render(w, "agent-form.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "Token": token, "DisplayName": displayName})
+	}
+}
+
+// agentDelete mencabut token dan menghapus agent dari daftar MiniUptime.
+func agentDelete(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id < 1 {
+			http.Error(w, "invalid agent", 400)
+			return
+		}
+		if _, err := db.Exec("DELETE FROM agents WHERE id=?", id); err != nil {
+			http.Error(w, "unable to remove agent", 500)
+			return
+		}
+		http.Redirect(w, r, "/agents", http.StatusSeeOther)
+	}
+}
+
+type agentScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanAgent(scanner agentScanner, now time.Time) (agentView, error) {
+	var view agentView
+	var heartbeat, collected string
+	var memoryTotal, memoryAvailable, diskTotal, diskAvailable uint64
+	var internetPing, gatewayPing sql.NullFloat64
+	if err := scanner.Scan(&view.ID, &view.DisplayName, &view.Hostname, &view.Status, &heartbeat, &collected, &view.PrimaryIP, &view.OS, &view.Architecture, &view.CPUs, &memoryTotal, &memoryAvailable, &view.DiskPath, &diskTotal, &diskAvailable, &internetPing, &view.GatewayIP, &gatewayPing); err != nil {
+		return view, err
+	}
+	view.Heartbeat, view.Collected = humanAgentTime(heartbeat), humanAgentTime(collected)
+	if view.DisplayName == "" {
+		view.DisplayName = view.Hostname
+	}
+	view.Online = heartbeat != "" && agentOnline(heartbeat, now)
+	if !view.Online {
+		view.Status = "offline"
+	}
+	view.MemoryTotal, view.MemoryAvailable = formatBytes(memoryTotal), formatBytes(memoryAvailable)
+	view.DiskTotal, view.DiskAvailable = formatBytes(diskTotal), formatBytes(diskAvailable)
+	view.InternetPing, view.GatewayPing = formatAgentPing(internetPing), formatAgentPing(gatewayPing)
+	return view, nil
+}
+
+func agentCounts(db *sql.DB) (int, int, int) {
+	rows, err := db.Query("SELECT heartbeat_at FROM agents")
+	if err != nil {
+		return 0, 0, 0
+	}
+	defer rows.Close()
+	total, online := 0, 0
+	now := time.Now().UTC()
+	for rows.Next() {
+		var heartbeat string
+		if rows.Scan(&heartbeat) != nil {
+			continue
+		}
+		total++
+		if heartbeat != "" && agentOnline(heartbeat, now) {
+			online++
+		}
+	}
+	return total, online, total - online
+}
+
+func humanAgentTime(value string) string {
+	if value == "" {
+		return "Never"
+	}
+	return humanTime(value)
+}
+
+func formatAgentPing(value sql.NullFloat64) string {
+	if !value.Valid {
+		return "—"
+	}
+	return strconv.FormatFloat(value.Float64, 'f', 1, 64) + " ms"
+}
+
+func formatBytes(value uint64) string {
+	if value == 0 {
+		return "—"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	amount := float64(value)
+	unit := 0
+	for amount >= 1024 && unit < len(units)-1 {
+		amount /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%.0f %s", amount, units[unit])
+	}
+	return fmt.Sprintf("%.1f %s", amount, units[unit])
+}
+
+// validAgentHealth memastikan data minimum tersedia dan timestamp dapat dipakai sebagai waktu UTC.
+func validAgentHealth(payload agentHealthPayload) bool {
+	if strings.TrimSpace(payload.Hostname) == "" || len(payload.Hostname) > 255 || strings.TrimSpace(payload.OS) == "" || strings.TrimSpace(payload.Architecture) == "" || payload.CPUs < 1 || payload.Memory.TotalBytes == 0 || payload.Disk.TotalBytes == 0 {
+		return false
+	}
+	collected, err := time.Parse(time.RFC3339, payload.CollectedAt)
+	if err != nil || collected.IsZero() {
+		return false
+	}
+	return payload.Memory.AvailableBytes <= payload.Memory.TotalBytes && payload.Disk.AvailableBytes <= payload.Disk.TotalBytes
+}
+
+// agentOnline menentukan status berdasarkan tiga kali interval heartbeat yang dikonfigurasi.
+func agentOnline(heartbeatAt string, now time.Time) bool {
+	interval := durationEnv("AGENT_HEARTBEAT_INTERVAL", time.Minute)
+	heartbeat, err := time.Parse(time.RFC3339, heartbeatAt)
+	return err == nil && now.Sub(heartbeat) <= 3*interval
+}
+
+// durationEnv membaca durasi interval agent dari environment dengan fallback aman.
+func durationEnv(key string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(key))
+	if parsed, err := time.ParseDuration(value); err == nil && parsed > 0 {
+		return parsed
+	}
+	return fallback
+}
+
 func configured(db *sql.DB) bool {
 	var n int
 	if err := db.QueryRow("SELECT COUNT(*) FROM admins").Scan(&n); err != nil {
@@ -435,7 +768,8 @@ func dashboard(db *sql.DB) http.HandlerFunc {
 			}
 			incidents = append(incidents, map[string]string{"Name": name, "Started": humanTime(started), "Ended": incidentEnded(ended)})
 		}
-		render(w, "dashboard.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "Total": total, "Up": up, "Down": down, "Monitors": monitors, "Incidents": incidents})
+		agentTotal, agentUp, agentDown := agentCounts(db)
+		render(w, "dashboard.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "Total": total, "Up": up, "Down": down, "Monitors": monitors, "Incidents": incidents, "AgentTotal": agentTotal, "AgentUp": agentUp, "AgentDown": agentDown})
 	}
 }
 
@@ -1323,9 +1657,45 @@ func render(w http.ResponseWriter, name string, data any) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := t.Execute(w, data); err != nil {
+	var output bytes.Buffer
+	if err := t.Execute(&output, data); err != nil {
 		log.Printf("render %s: %v", name, err)
+		return
 	}
+	page := normalizeNavbar(output.String())
+	if name == "dashboard.html" {
+		if values, ok := data.(map[string]any); ok {
+			if total, ok := values["AgentTotal"].(int); ok {
+				up, _ := values["AgentUp"].(int)
+				down, _ := values["AgentDown"].(int)
+				card := fmt.Sprintf(`<div class="card"><span class="muted">Agents</span><h2>%d</h2><span class="muted">%d online · %d offline</span><br><a href="/agents">View agents →</a></div>`, total, up, down)
+				page = strings.Replace(page, `<div class="grid">`, `<div class="grid">`+card, 1)
+			}
+		}
+	}
+	_, _ = io.WriteString(w, page)
+}
+
+// normalizeNavbar menjaga urutan menu tetap sama walaupun template lama masih inline.
+func normalizeNavbar(page string) string {
+	start := strings.Index(page, "<nav>")
+	if start < 0 {
+		return page
+	}
+	relativeEnd := strings.Index(page[start:], "</nav>")
+	if relativeEnd < 0 {
+		return page
+	}
+	end := start + relativeEnd
+	existingNav := page[start:end]
+	logout := ""
+	if formStart := strings.Index(existingNav, `<form method="post" action="/logout"`); formStart >= 0 {
+		if formEnd := strings.Index(existingNav[formStart:], "</form>"); formEnd >= 0 {
+			logout = existingNav[formStart : formStart+formEnd+len("</form>")]
+		}
+	}
+	nav := `<nav><strong>MiniUptime</strong><a href="/dashboard">Dashboard</a><a href="/monitors">Monitors</a><a href="/agents">Agents</a><a href="/groups">Groups</a><a href="/incidents">Incidents</a><a href="/settings">Settings</a><a href="/display">Display</a>` + logout + `</nav>`
+	return page[:start] + nav + page[end+len("</nav>"):]
 }
 func hashPassword(p string) (string, error) {
 	salt := make([]byte, 16)
