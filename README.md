@@ -99,6 +99,27 @@ Monitor data is stored in `./data`. Back up this directory before upgrades or da
 
 The main workflows are designed for both desktop administration and wallboard display.
 
+### Dashboard
+
+The dashboard summarizes monitor health and agent availability in one view.
+
+![MiniUptime Dashboard](docs/screenshots/dashboard.jpg)
+
+![MiniUptime Dashboard monitor status](docs/screenshots/dashboard-bottom.jpg)
+
+### Agent overview
+
+The agent overview shows display names, technical hostnames, heartbeat freshness,
+resource metrics, latency, and token revocation actions.
+
+![MiniUptime Agent overview](docs/screenshots/agents.jpg)
+
+### Agent detail
+
+The detail view provides the latest system health snapshot for one PC.
+
+![MiniUptime Agent detail](docs/screenshots/agent-detail.jpg)
+
 ### Display wallboard
 
 Comfortable mode keeps the monitor cards spacious and readable from a nearby screen.
