@@ -85,6 +85,26 @@ func TestDisplayPINHash(t *testing.T) {
 	}
 }
 
+func TestMonitorAlertEscapesAndRedacts(t *testing.T) {
+	alert := formatMonitorAlert(monitorAlertData{Name: "API <prod>", Type: "http", Target: "https://user:pass@example.com/health?token=secret", Group: "Production & Core"}, "down", 0, "<timeout>", "2026-08-18T14:42:10Z", "")
+	for _, forbidden := range []string{"secret", "user:pass", "<prod>", "<timeout>"} {
+		if strings.Contains(alert, forbidden) {
+			t.Fatalf("alert leaked %q: %s", forbidden, alert)
+		}
+	}
+	for _, expected := range []string{"MONITOR DOWN", "API &lt;prod&gt;", "example.com/health?redacted", "Production &amp; Core", "&lt;timeout&gt;"} {
+		if !strings.Contains(alert, expected) {
+			t.Fatalf("alert missing %q: %s", expected, alert)
+		}
+	}
+}
+
+func TestHumanDuration(t *testing.T) {
+	if got := humanDuration(25*time.Hour + 2*time.Minute + 3*time.Second); got != "1d 1h 2m 3s" {
+		t.Fatalf("duration=%q", got)
+	}
+}
+
 func TestDisplaySummaryAndAverage(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

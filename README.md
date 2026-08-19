@@ -14,7 +14,7 @@ MiniUptime is a single Go binary backed by SQLite and packaged as one small Dock
 - HTTP, TCP, and ICMP Ping checks
 - Live status updates through Server-Sent Events
 - Incident tracking with recovery detection
-- Optional Telegram alerts for DOWN and RECOVERED events
+- Optional rich Telegram alerts for DOWN and RECOVERED events
 - Responsive admin UI and read-only display mode
 
 ## Features
@@ -40,6 +40,7 @@ MiniUptime is a single Go binary backed by SQLite and packaged as one small Dock
 - Dashboard summary and recent incidents
 - Open and recovered incident history
 - Optional Telegram notifications
+- HTML-formatted Telegram alerts with group, latency, error, and downtime context
 - `/display` read-only wallboard with:
   - Online count and online rate
   - Latest and average latency per monitor

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"html/template"
 	"io/fs"
 	"log"
@@ -820,21 +821,25 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 		log.Printf("insert check %d: %v", id, err)
 	}
 	if status == "down" && previous != "down" {
-		var monitorName string
-		if err := db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName); err != nil {
-			log.Printf("read monitor %d name: %v", id, err)
+		if alert, err := monitorAlert(db, id, "down", latency, message, now, ""); err == nil {
+			go func() { _ = telegramAlert(db, alert) }()
+		} else {
+			log.Printf("build down alert %d: %v", id, err)
 		}
-		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime DOWN: %s: %s", monitorName, message)) }()
 		if err := execRetry(db, "INSERT OR IGNORE INTO incidents(monitor_id,started_at,error) VALUES(?,?,?)", id, now, message); err != nil {
 			log.Printf("open incident %d: %v", id, err)
 		}
 	}
 	if status == "up" && previous == "down" {
-		var monitorName string
-		if err := db.QueryRow("SELECT name FROM monitors WHERE id=?", id).Scan(&monitorName); err != nil {
-			log.Printf("read monitor %d name: %v", id, err)
+		var startedAt string
+		if err := db.QueryRow("SELECT started_at FROM incidents WHERE monitor_id=? AND ended_at IS NULL ORDER BY id DESC LIMIT 1", id).Scan(&startedAt); err != nil {
+			log.Printf("read incident %d start: %v", id, err)
 		}
-		go func() { _ = telegramAlert(db, fmt.Sprintf("MiniUptime RECOVERED: %s", monitorName)) }()
+		if alert, err := monitorAlert(db, id, "recovered", latency, "", now, startedAt); err == nil {
+			go func() { _ = telegramAlert(db, alert) }()
+		} else {
+			log.Printf("build recovered alert %d: %v", id, err)
+		}
 		if err := execRetry(db, "UPDATE incidents SET ended_at=? WHERE monitor_id=? AND ended_at IS NULL", now, id); err != nil {
 			log.Printf("close incident %d: %v", id, err)
 		}
@@ -954,6 +959,79 @@ func settingsTest(db *sql.DB) http.HandlerFunc {
 		http.Redirect(w, r, "/settings?telegram_sent=1", 303)
 	}
 }
+
+type monitorAlertData struct {
+	Name, Type, Target, Group string
+}
+
+func monitorAlert(db *sql.DB, id int, event string, latency int64, message, checkedAt, startedAt string) (string, error) {
+	var data monitorAlertData
+	if err := db.QueryRow("SELECT m.name,m.type,m.target,COALESCE(g.name,'') FROM monitors m LEFT JOIN groups g ON g.id=m.group_id WHERE m.id=?", id).Scan(&data.Name, &data.Type, &data.Target, &data.Group); err != nil {
+		return "", err
+	}
+	return formatMonitorAlert(data, event, latency, message, checkedAt, startedAt), nil
+}
+
+func formatMonitorAlert(data monitorAlertData, event string, latency int64, message, checkedAt, startedAt string) string {
+	name := html.EscapeString(data.Name)
+	target := html.EscapeString(sanitizeAlertTarget(data.Target))
+	typ := html.EscapeString(strings.ToUpper(data.Type))
+	group := html.EscapeString(data.Group)
+	timeText := html.EscapeString(humanTime(checkedAt))
+	groupLine := ""
+	if group != "" {
+		groupLine = fmt.Sprintf("\n<b>Group:</b> %s", group)
+	}
+	if event == "recovered" {
+		downtime := "unknown"
+		if startedAt != "" {
+			if started, err := time.Parse(time.RFC3339, startedAt); err == nil {
+				if ended, endErr := time.Parse(time.RFC3339, checkedAt); endErr == nil {
+					downtime = humanDuration(ended.Sub(started))
+				}
+			}
+		}
+		return fmt.Sprintf("🟢 <b>MONITOR RECOVERED</b>\n\n<b>%s</b>\n<b>Type:</b> %s\n<b>Target:</b> <code>%s</code>%s\n<b>Downtime:</b> %s\n<b>Latest latency:</b> %d ms\n<b>Recovered:</b> %s", name, typ, target, groupLine, downtime, latency, timeText)
+	}
+	return fmt.Sprintf("🔴 <b>MONITOR DOWN</b>\n\n<b>%s</b>\n<b>Type:</b> %s\n<b>Target:</b> <code>%s</code>%s\n<b>Error:</b> %s\n<b>Detected:</b> %s", name, typ, target, groupLine, html.EscapeString(message), timeText)
+}
+
+func sanitizeAlertTarget(target string) string {
+	u, err := url.Parse(target)
+	if err != nil || u.Scheme == "" {
+		return target
+	}
+	u.User = nil
+	if u.RawQuery != "" {
+		u.RawQuery = "redacted"
+	}
+	return u.String()
+}
+
+func humanDuration(duration time.Duration) string {
+	if duration < 0 {
+		return "unknown"
+	}
+	seconds := int64(duration.Round(time.Second) / time.Second)
+	days, seconds := seconds/86400, seconds%86400
+	hours, seconds := seconds/3600, seconds%3600
+	minutes, seconds := seconds/60, seconds%60
+	parts := []string{}
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%dd", days))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if minutes > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", minutes))
+	}
+	if seconds > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", seconds))
+	}
+	return strings.Join(parts, " ")
+}
+
 func telegramAlert(db *sql.DB, message string) error {
 	var token, chatID string
 	db.QueryRow("SELECT value FROM settings WHERE key='telegram_token'").Scan(&token)
@@ -969,7 +1047,7 @@ func telegramAlert(db *sql.DB, message string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	body := strings.NewReader(url.Values{"chat_id": {chatID}, "text": {message}}.Encode())
+	body := strings.NewReader(url.Values{"chat_id": {chatID}, "text": {message}, "parse_mode": {"HTML"}}.Encode())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/sendMessage", body)
 	if err != nil {
 		return err
