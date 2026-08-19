@@ -4,3 +4,5 @@ data/
 *.db-shm
 *.db-wal
 .env
+*.exe
+SESSION.md

@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -87,6 +88,7 @@ func main() {
 	mux.Handle("POST /display/unlock", csrf(displayUnlock(db)))
 	mux.HandleFunc("GET /groups", requireAuth(db, groupsPage(db)))
 	mux.Handle("POST /groups", csrf(requireAuth(db, groupCreate(db))))
+	mux.Handle("POST /groups/{id}/monitors", csrf(requireAuth(db, groupAssignMonitors(db))))
 	mux.Handle("POST /groups/{id}/delete", csrf(requireAuth(db, groupDelete(db))))
 	mux.HandleFunc("GET /monitors", requireAuth(db, monitorsPage(db)))
 	mux.HandleFunc("GET /monitors/{id}", requireAuth(db, monitorDetail(db)))
@@ -94,7 +96,7 @@ func main() {
 	mux.HandleFunc("GET /settings", requireAuth(db, settingsPage(db)))
 	mux.Handle("POST /settings", csrf(requireAuth(db, settingsSave(db))))
 	mux.Handle("POST /settings/test", csrf(requireAuth(db, settingsTest(db))))
-	mux.HandleFunc("GET /monitors/new", requireAuth(db, monitorForm))
+	mux.HandleFunc("GET /monitors/new", requireAuth(db, monitorForm(db)))
 	mux.HandleFunc("GET /monitors/{id}/edit", requireAuth(db, monitorEditPage(db)))
 	mux.Handle("POST /monitors", csrf(requireAuth(db, monitorCreate(db))))
 	mux.Handle("POST /monitors/{id}", csrf(requireAuth(db, monitorUpdate(db))))
@@ -343,21 +345,48 @@ func display(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		groupName := strings.TrimSpace(r.URL.Query().Get("group"))
-		rows, _ := db.Query("SELECT m.id,m.name,m.type,m.target,m.current_status,m.last_latency_ms,COALESCE(i.started_at,'') FROM monitors m LEFT JOIN groups g ON g.id=m.group_id LEFT JOIN incidents i ON i.monitor_id=m.id AND i.ended_at IS NULL WHERE m.enabled=1 AND (?='' OR g.name=?) ORDER BY CASE m.current_status WHEN 'down' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,m.name", groupName, groupName)
+		density := r.URL.Query().Get("density")
+		if density != "compact" {
+			density = "comfortable"
+		}
+		rows, _ := db.Query("SELECT m.id,m.name,m.type,m.target,m.current_status,m.last_latency_ms,COALESCE(m.checked_at,''),COALESCE(i.started_at,''),COALESCE((SELECT AVG(c.latency_ms) FROM (SELECT latency_ms FROM checks WHERE monitor_id=m.id ORDER BY id DESC LIMIT 50) c),-1) FROM monitors m LEFT JOIN groups g ON g.id=m.group_id LEFT JOIN incidents i ON i.monitor_id=m.id AND i.ended_at IS NULL WHERE m.enabled=1 AND (?='' OR g.name=?) ORDER BY CASE m.current_status WHEN 'down' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,m.name", groupName, groupName)
 		if rows == nil {
 			http.Error(w, "unable to load monitors", 500)
 			return
 		}
 		defer rows.Close()
 		var monitors []map[string]any
+		online := 0
 		for rows.Next() {
 			var id, lat int
-			var name, typ, target, status, downSince string
-			if rows.Scan(&id, &name, &typ, &target, &status, &lat, &downSince) == nil {
-				monitors = append(monitors, map[string]any{"ID": id, "Name": name, "Type": typ, "Target": target, "Status": status, "Latency": lat, "DownSince": humanTime(downSince)})
+			var name, typ, target, status, checkedAt, downSince string
+			var average float64
+			if rows.Scan(&id, &name, &typ, &target, &status, &lat, &checkedAt, &downSince, &average) == nil {
+				averageText := "—"
+				if average >= 0 {
+					averageText = fmt.Sprintf("%d ms", int(average+0.5))
+				}
+				if status == "up" {
+					online++
+				}
+				lastChecked := humanTime(checkedAt)
+				if checkedAt == "" {
+					lastChecked = "Never checked"
+				}
+				monitors = append(monitors, map[string]any{"ID": id, "Name": name, "Type": typ, "Target": target, "Status": status, "Latency": lat, "Average": averageText, "LastChecked": lastChecked, "DownSince": humanTime(downSince)})
 			}
 		}
-		render(w, "display.html", map[string]any{"Monitors": monitors, "Group": groupName})
+		percentage := 0
+		if len(monitors) > 0 {
+			percentage = online * 100 / len(monitors)
+		}
+		comfortableURL := "/display?density=comfortable"
+		compactURL := "/display?density=compact"
+		if groupName != "" {
+			comfortableURL += "&group=" + url.QueryEscape(groupName)
+			compactURL += "&group=" + url.QueryEscape(groupName)
+		}
+		render(w, "display.html", map[string]any{"Monitors": monitors, "Group": groupName, "Online": online, "Total": len(monitors), "Percentage": percentage, "Density": density, "ComfortableURL": comfortableURL, "CompactURL": compactURL})
 	}
 }
 func dashboard(db *sql.DB) http.HandlerFunc {
@@ -397,21 +426,30 @@ func dashboard(db *sql.DB) http.HandlerFunc {
 				log.Printf("dashboard incident scan: %v", err)
 				continue
 			}
-			incidents = append(incidents, map[string]string{"Name": name, "Started": started, "Ended": ended})
+			incidents = append(incidents, map[string]string{"Name": name, "Started": humanTime(started), "Ended": incidentEnded(ended)})
 		}
 		render(w, "dashboard.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "Total": total, "Up": up, "Down": down, "Monitors": monitors, "Incidents": incidents})
 	}
 }
 
 type group struct {
-	ID   int
-	Name string
-	CSRF string
+	ID           int
+	Name         string
+	Monitors     []groupMonitor
+	MonitorCount int
+	CSRF         string
+}
+
+type groupMonitor struct {
+	ID       int
+	Name     string
+	Target   string
+	Selected bool
 }
 
 func groupsPage(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rows, err := db.Query("SELECT g.id,g.name,COUNT(m.id) FROM groups g LEFT JOIN monitors m ON m.group_id=g.id GROUP BY g.id,g.name ORDER BY g.name")
+		rows, err := db.Query("SELECT id,name FROM groups ORDER BY name")
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -420,18 +458,84 @@ func groupsPage(db *sql.DB) http.HandlerFunc {
 		var list []group
 		for rows.Next() {
 			var g group
-			var count int
-			if err := rows.Scan(&g.ID, &g.Name, &count); err != nil {
+			if err := rows.Scan(&g.ID, &g.Name); err != nil {
 				http.Error(w, err.Error(), 500)
 				return
 			}
 			list = append(list, g)
+		}
+		monitorRows, err := db.Query("SELECT id,name,target,COALESCE(group_id,0) FROM monitors ORDER BY name")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer monitorRows.Close()
+		for monitorRows.Next() {
+			var m groupMonitor
+			var groupID int
+			if err := monitorRows.Scan(&m.ID, &m.Name, &m.Target, &groupID); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			for i := range list {
+				candidate := m
+				candidate.Selected = list[i].ID == groupID
+				if candidate.Selected {
+					list[i].MonitorCount++
+				}
+				list[i].Monitors = append(list[i].Monitors, candidate)
+			}
 		}
 		token := csrfData(w, r)["CSRF"]
 		for i := range list {
 			list[i].CSRF = token
 		}
 		render(w, "groups.html", map[string]any{"Groups": list, "CSRF": token})
+	}
+}
+
+func groupAssignMonitors(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		groupID, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || groupID < 1 {
+			http.Error(w, "invalid group", 400)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "invalid form", 400)
+			return
+		}
+		var exists bool
+		if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM groups WHERE id=?)", groupID).Scan(&exists); err != nil || !exists {
+			http.Error(w, "group not found", 404)
+			return
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			http.Error(w, "unable to save group monitors", 500)
+			return
+		}
+		defer tx.Rollback()
+		if _, err = tx.Exec("UPDATE monitors SET group_id=NULL WHERE group_id=?", groupID); err != nil {
+			http.Error(w, "unable to save group monitors", 500)
+			return
+		}
+		for _, rawID := range r.Form["monitor_id"] {
+			monitorID, parseErr := strconv.Atoi(rawID)
+			if parseErr != nil || monitorID < 1 {
+				http.Error(w, "invalid monitor", 400)
+				return
+			}
+			if _, err = tx.Exec("UPDATE monitors SET group_id=? WHERE id=?", groupID, monitorID); err != nil {
+				http.Error(w, "unable to save group monitors", 500)
+				return
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			http.Error(w, "unable to save group monitors", 500)
+			return
+		}
+		http.Redirect(w, r, "/groups", 303)
 	}
 }
 func groupCreate(db *sql.DB) http.HandlerFunc {
@@ -506,8 +610,25 @@ func monitorsPage(db *sql.DB) http.HandlerFunc {
 		render(w, "monitors.html", map[string]any{"Monitors": list, "Query": q, "Group": groupName, "Groups": groups, "CSRF": token})
 	}
 }
-func monitorForm(w http.ResponseWriter, r *http.Request) {
-	render(w, "monitor-form.html", csrfData(w, r))
+func monitorForm(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		groups := []group{}
+		rows, err := db.Query("SELECT id,name FROM groups ORDER BY name")
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var g group
+			if err := rows.Scan(&g.ID, &g.Name); err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			groups = append(groups, g)
+		}
+		render(w, "monitor-form.html", map[string]any{"Groups": groups, "CSRF": csrfData(w, r)["CSRF"]})
+	}
 }
 func monitorEditPage(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -887,7 +1008,7 @@ func incidentsPage(db *sql.DB) http.HandlerFunc {
 				log.Printf("incident scan: %v", err)
 				continue
 			}
-			incidents = append(incidents, map[string]string{"Started": started, "Ended": ended, "Monitor": name, "Error": e})
+			incidents = append(incidents, map[string]string{"Started": humanTime(started), "Ended": incidentEnded(ended), "Monitor": name, "Error": e})
 		}
 		render(w, "incidents.html", incidents)
 	}
@@ -967,6 +1088,12 @@ func humanTime(value string) string {
 	}
 	return t.Local().Format("02 Jan, 15:04")
 }
+func incidentEnded(value string) string {
+	if value == "" {
+		return "Ongoing"
+	}
+	return humanTime(value)
+}
 func validMonitor(typ, name, target string, interval int) bool {
 	target = strings.TrimSpace(target)
 	if typ == "http" {
@@ -1004,7 +1131,21 @@ func monitorCreate(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "interval must be at least 10 seconds", 400)
 			return
 		}
-		_, err := db.Exec("INSERT INTO monitors(name,type,target,interval_seconds,created_at) VALUES(?,?,?,?,?)", name, typ, target, interval, time.Now().UTC().Format(time.RFC3339))
+		var groupID any
+		if rawGroupID := strings.TrimSpace(r.FormValue("group_id")); rawGroupID != "" {
+			parsedGroupID, parseErr := strconv.Atoi(rawGroupID)
+			if parseErr != nil || parsedGroupID < 1 {
+				http.Error(w, "invalid group", 400)
+				return
+			}
+			var exists bool
+			if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM groups WHERE id=?)", parsedGroupID).Scan(&exists); err != nil || !exists {
+				http.Error(w, "group not found", 404)
+				return
+			}
+			groupID = parsedGroupID
+		}
+		_, err := db.Exec("INSERT INTO monitors(name,type,target,interval_seconds,group_id,created_at) VALUES(?,?,?,?,?,?)", name, typ, target, interval, groupID, time.Now().UTC().Format(time.RFC3339))
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return

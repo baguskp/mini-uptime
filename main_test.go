@@ -85,12 +85,39 @@ func TestDisplayPINHash(t *testing.T) {
 	}
 }
 
+func TestDisplaySummaryAndAverage(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE groups(id INTEGER PRIMARY KEY,name TEXT); CREATE TABLE monitors(id INTEGER PRIMARY KEY,group_id INTEGER,name TEXT,type TEXT,target TEXT,current_status TEXT,last_latency_ms INTEGER,checked_at TEXT,enabled INTEGER); CREATE TABLE incidents(monitor_id INTEGER,started_at TEXT,ended_at TEXT); CREATE TABLE checks(id INTEGER PRIMARY KEY,monitor_id INTEGER,latency_ms INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = db.Exec("INSERT INTO settings VALUES('display_mode','public'); INSERT INTO monitors VALUES(1,NULL,'API','http','https://api.example.com','up',18,'2026-08-18T14:42:10Z',1),(2,NULL,'Router','ping','10.0.0.1','down',0,'',1); INSERT INTO checks VALUES(1,1,10),(2,1,14); INSERT INTO incidents VALUES(2,'2026-08-18T14:42:10Z',NULL)")
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/display", nil)
+	display(db)(w, r)
+	body := w.Body.String()
+	for _, expected := range []string{"1/2", "50%", "12 ms", "API", "Router"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("display missing %q", expected)
+		}
+	}
+}
+
 func TestHumanTime(t *testing.T) {
 	if got := humanTime("2026-08-18T14:42:10Z"); got != time.Date(2026, 8, 18, 14, 42, 10, 0, time.UTC).Local().Format("02 Jan, 15:04") {
 		t.Fatalf("humanTime=%q", got)
 	}
 	if got := humanTime("bad"); got != "bad" {
 		t.Fatalf("invalid time=%q", got)
+	}
+	if got := incidentEnded(""); got != "Ongoing" {
+		t.Fatalf("open incident time=%q", got)
+	}
+	if got := incidentEnded("2026-08-18T14:42:10Z"); got != humanTime("2026-08-18T14:42:10Z") {
+		t.Fatalf("ended incident time=%q", got)
 	}
 }
 
@@ -125,5 +152,40 @@ func TestValidMonitor(t *testing.T) {
 	}
 	if validMonitor("ping", "router", "https://example.com", 10) {
 		t.Fatal("url accepted as ping")
+	}
+}
+
+func TestGroupAssignMonitors(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec("CREATE TABLE groups(id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE monitors(id INTEGER PRIMARY KEY, group_id INTEGER, name TEXT, target TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec("INSERT INTO groups(id,name) VALUES(1,'Production'),(2,'Staging'); INSERT INTO monitors(id,group_id,name,target) VALUES(1,1,'API','https://api.example.com'),(2,2,'Web','https://example.com')"); err != nil {
+		t.Fatal(err)
+	}
+	r := httptest.NewRequest("POST", "/groups/1/monitors", strings.NewReader("monitor_id=2"))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.SetPathValue("id", "1")
+	w := httptest.NewRecorder()
+	groupAssignMonitors(db)(w, r)
+	if w.Code != 303 {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var groupID sql.NullInt64
+	if err := db.QueryRow("SELECT group_id FROM monitors WHERE id=1").Scan(&groupID); err != nil {
+		t.Fatal(err)
+	}
+	if groupID.Valid {
+		t.Fatalf("old monitor group_id=%d", groupID.Int64)
+	}
+	if err := db.QueryRow("SELECT group_id FROM monitors WHERE id=2").Scan(&groupID); err != nil {
+		t.Fatal(err)
+	}
+	if !groupID.Valid || groupID.Int64 != 1 {
+		t.Fatalf("selected monitor group_id=%v", groupID)
 	}
 }
