@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -822,7 +823,11 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 	}
 	if status == "down" && previous != "down" {
 		if alert, err := monitorAlert(db, id, "down", latency, message, now, ""); err == nil {
-			go func() { _ = telegramAlert(db, alert) }()
+			go func() {
+				if err := telegramAlert(db, alert); err != nil {
+					log.Printf("Telegram DOWN alert %d: %v", id, err)
+				}
+			}()
 		} else {
 			log.Printf("build down alert %d: %v", id, err)
 		}
@@ -836,7 +841,11 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 			log.Printf("read incident %d start: %v", id, err)
 		}
 		if alert, err := monitorAlert(db, id, "recovered", latency, "", now, startedAt); err == nil {
-			go func() { _ = telegramAlert(db, alert) }()
+			go func() {
+				if err := telegramAlert(db, alert); err != nil {
+					log.Printf("Telegram RECOVERED alert %d: %v", id, err)
+				}
+			}()
 		} else {
 			log.Printf("build recovered alert %d: %v", id, err)
 		}
@@ -1058,8 +1067,19 @@ func telegramAlert(db *sql.DB, message string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	responseBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return readErr
+	}
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("Telegram returned %s", resp.Status)
+	}
+	var result struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(responseBody, &result); err == nil && !result.OK {
+		return errors.New(result.Description)
 	}
 	return nil
 }
