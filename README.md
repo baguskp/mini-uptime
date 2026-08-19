@@ -1,5 +1,8 @@
 # MiniUptime
 
+[![Go](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/baguskp2609/mini-uptime)
+
 Lightweight, self-hosted uptime monitoring for HTTP endpoints, TCP services, and network devices.
 
 MiniUptime is a single Go binary backed by SQLite and packaged as one small Docker Compose service. It includes an admin console for managing monitors and groups, plus a read-only NOC display for TVs and wallboards.
@@ -64,6 +67,25 @@ Open:
 
 On first start, open the admin console and complete setup. Do not rely on credentials from development notes or examples.
 
+### Run the prebuilt image
+
+The latest image is available on Docker Hub:
+
+<https://hub.docker.com/r/baguskp2609/mini-uptime>
+
+```bash
+docker volume create miniuptime-data
+docker run -d \
+  --name miniuptime \
+  --restart unless-stopped \
+  --cap-add NET_RAW \
+  -p 3001:3000 \
+  -v miniuptime-data:/app/data \
+  baguskp2609/mini-uptime:v1.0.0
+```
+
+Use `baguskp2609/mini-uptime:latest` when you explicitly want the rolling image.
+
 ### Stop
 
 ```bash
@@ -71,6 +93,16 @@ docker compose down
 ```
 
 Monitor data is stored in `./data`. Back up this directory before upgrades or database maintenance.
+
+## Screenshots
+
+The main workflows are designed for both desktop administration and wallboard display:
+
+- Dashboard for current status and recent incidents
+- Groups for compact monitor assignment and filtering
+- Display for TV/NOC monitoring with Comfortable and Compact density modes
+
+Screenshots will be added as the public documentation set grows.
 
 ## Configuration
 
