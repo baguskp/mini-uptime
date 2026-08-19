@@ -96,17 +96,23 @@ Monitor data is stored in `./data`. Back up this directory before upgrades or da
 
 ## Screenshots
 
-The main workflows are designed for both desktop administration and wallboard display:
+The main workflows are designed for both desktop administration and wallboard display.
 
-- Dashboard for current status and recent incidents
-- Groups for compact monitor assignment and filtering
-- Display for TV/NOC monitoring with Comfortable and Compact density modes
+### Display wallboard
 
-Screenshots will be added as the public documentation set grows.
+Comfortable mode keeps the monitor cards spacious and readable from a nearby screen.
+
+![MiniUptime Display in Comfortable mode](docs/screenshots/display.png)
+
+### Compact display
+
+Compact mode fits more monitors into a single wallboard view.
+
+![MiniUptime Display in Compact mode](docs/screenshots/display-compact.png)
 
 ## Configuration
 
-The default Compose configuration sets the container timezone to `Asia/Jakarta` and exposes the app at host port `3001`.
+The default timezone is `UTC` and can be changed from **Settings** using an IANA timezone such as `Asia/Jakarta`. Compose exposes the app at host port `3001`.
 
 Optional Telegram alerts can be configured with environment variables:
 

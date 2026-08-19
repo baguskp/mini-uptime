@@ -40,6 +40,10 @@ var displayAttempts = struct {
 	sync.Mutex
 	items map[string][]time.Time
 }{items: make(map[string][]time.Time)}
+var appLocation = struct {
+	sync.RWMutex
+	value *time.Location
+}{value: time.UTC}
 
 func main() {
 	dbPath := getenv("DATABASE_PATH", "/app/data/miniuptime.db")
@@ -56,6 +60,7 @@ func main() {
 	if err := migrate(db); err != nil {
 		log.Fatal(err)
 	}
+	configureLocation(db)
 	go monitorLoop(db)
 	go retentionLoop(db)
 
@@ -765,7 +770,7 @@ func monitorLoop(db *sql.DB) {
 		if err != nil {
 			continue
 		}
-		now := time.Now()
+		now := currentLocationTime()
 		for rows.Next() {
 			var id, interval int
 			var typ, target, last string
@@ -791,7 +796,7 @@ type monitorJob struct {
 }
 
 func runCheck(db *sql.DB, id int, typ, target string) {
-	started := time.Now()
+	started := currentLocationTime()
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
 		err = checkTarget(typ, target)
@@ -840,14 +845,18 @@ func runCheck(db *sql.DB, id int, typ, target string) {
 }
 func settingsPage(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var token, chat, mode string
+		var token, chat, mode, timezone string
 		db.QueryRow("SELECT value FROM settings WHERE key='telegram_token'").Scan(&token)
 		db.QueryRow("SELECT value FROM settings WHERE key='telegram_chat_id'").Scan(&chat)
 		db.QueryRow("SELECT value FROM settings WHERE key='display_mode'").Scan(&mode)
+		db.QueryRow("SELECT value FROM settings WHERE key='timezone'").Scan(&timezone)
 		if mode == "" {
 			mode = "disabled"
 		}
-		render(w, "settings.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "TokenSet": token != "", "ChatID": chat, "DisplayMode": mode, "TelegramSent": r.URL.Query().Get("telegram_sent") == "1", "TelegramError": r.URL.Query().Get("telegram_error")})
+		if timezone == "" {
+			timezone = "UTC"
+		}
+		render(w, "settings.html", map[string]any{"CSRF": csrfData(w, r)["CSRF"], "TokenSet": token != "", "ChatID": chat, "DisplayMode": mode, "Timezone": timezone, "Timezones": timezoneOptions(), "TelegramSent": r.URL.Query().Get("telegram_sent") == "1", "TelegramError": r.URL.Query().Get("telegram_error")})
 	}
 }
 func settingsSave(db *sql.DB) http.HandlerFunc {
@@ -863,6 +872,17 @@ func settingsSave(db *sql.DB) http.HandlerFunc {
 				http.Error(w, "display PIN minimum 4 characters", 400)
 				return
 			}
+		}
+		if timezone := strings.TrimSpace(r.FormValue("timezone")); timezone != "" {
+			if _, err := time.LoadLocation(timezone); err != nil {
+				http.Error(w, "invalid timezone", 400)
+				return
+			}
+			if _, err := db.Exec("INSERT INTO settings(key,value) VALUES('timezone',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", timezone); err != nil {
+				http.Error(w, "unable to save timezone", 500)
+				return
+			}
+			setLocation(timezone)
 		}
 		if pin := strings.TrimSpace(r.FormValue("display_pin")); pin != "" {
 			hash, e := hashPassword(pin)
@@ -896,7 +916,7 @@ func displayUnlock(db *sql.DB) http.HandlerFunc {
 		db.QueryRow("SELECT value FROM settings WHERE key='display_pin'").Scan(&pin)
 		ip := strings.Split(r.RemoteAddr, ":")[0]
 		displayAttempts.Lock()
-		now := time.Now()
+		now := currentLocationTime()
 		recent := displayAttempts.items[ip][:0]
 		for _, at := range displayAttempts.items[ip] {
 			if now.Sub(at) < time.Minute {
@@ -1086,7 +1106,33 @@ func humanTime(value string) string {
 	if e != nil {
 		return value
 	}
-	return t.Local().Format("02 Jan, 15:04")
+	return t.In(currentLocation()).Format("02 Jan, 15:04")
+}
+func timezoneOptions() []string {
+	return []string{"UTC", "Asia/Jakarta", "Asia/Singapore", "Asia/Tokyo", "Australia/Sydney", "Europe/London", "Europe/Amsterdam", "America/New_York", "America/Los_Angeles"}
+}
+func configureLocation(db *sql.DB) {
+	var timezone string
+	if db.QueryRow("SELECT value FROM settings WHERE key='timezone'").Scan(&timezone) == nil && timezone != "" {
+		setLocation(timezone)
+	}
+}
+func setLocation(timezone string) {
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		return
+	}
+	appLocation.Lock()
+	appLocation.value = location
+	appLocation.Unlock()
+}
+func currentLocation() *time.Location {
+	appLocation.RLock()
+	defer appLocation.RUnlock()
+	return appLocation.value
+}
+func currentLocationTime() time.Time {
+	return time.Now().In(currentLocation())
 }
 func incidentEnded(value string) string {
 	if value == "" {

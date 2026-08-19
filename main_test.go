@@ -107,7 +107,7 @@ func TestDisplaySummaryAndAverage(t *testing.T) {
 }
 
 func TestHumanTime(t *testing.T) {
-	if got := humanTime("2026-08-18T14:42:10Z"); got != time.Date(2026, 8, 18, 14, 42, 10, 0, time.UTC).Local().Format("02 Jan, 15:04") {
+	if got := humanTime("2026-08-18T14:42:10Z"); got != time.Date(2026, 8, 18, 14, 42, 10, 0, time.UTC).Format("02 Jan, 15:04") {
 		t.Fatalf("humanTime=%q", got)
 	}
 	if got := humanTime("bad"); got != "bad" {
