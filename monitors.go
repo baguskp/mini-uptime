@@ -218,11 +218,11 @@ func monitorDetail(db *sql.DB) http.HandlerFunc {
 		}
 		graphCaption := "No checks yet"
 		if len(checks) == 1 {
-			graphCaption = checks[0]["Time"].(string) + " ┬À last 1 check"
+			graphCaption = checks[0]["Time"].(string) + " · last 1 check"
 		} else if len(checks) > 1 {
 			oldest := checks[len(checks)-1]["Time"].(string)
 			newest := checks[0]["Time"].(string)
-			graphCaption = oldest + " ÔÇô " + newest + " ┬À last 50 checks"
+			graphCaption = oldest + " – " + newest + " · last 50 checks"
 		}
 		render(w, "monitor-detail.html", map[string]any{"Monitor": m, "Checks": checks, "Avg": avg, "P95": p95, "Min": minLatency, "Max": maxLatency, "GraphCaption": graphCaption})
 	}

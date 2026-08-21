@@ -261,14 +261,14 @@ func humanAgentTime(value string) string {
 
 func formatAgentPing(value sql.NullFloat64) string {
 	if !value.Valid {
-		return "ÔÇö"
+		return "—"
 	}
 	return strconv.FormatFloat(value.Float64, 'f', 1, 64) + " ms"
 }
 
 func formatBytes(value uint64) string {
 	if value == 0 {
-		return "ÔÇö"
+		return "—"
 	}
 	units := []string{"B", "KB", "MB", "GB", "TB"}
 	amount := float64(value)

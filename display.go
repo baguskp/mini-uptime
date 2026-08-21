@@ -114,7 +114,7 @@ func display(db *sql.DB) http.HandlerFunc {
 			var name, typ, target, status, checkedAt, downSince string
 			var average float64
 			if rows.Scan(&id, &name, &typ, &target, &status, &lat, &checkedAt, &downSince, &average) == nil {
-				averageText := "ÔÇö"
+				averageText := "—"
 				if average >= 0 {
 					averageText = fmt.Sprintf("%d ms", int(average+0.5))
 				}
