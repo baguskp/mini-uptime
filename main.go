@@ -1662,22 +1662,22 @@ func render(w http.ResponseWriter, name string, data any) {
 		log.Printf("render %s: %v", name, err)
 		return
 	}
-	page := normalizeNavbar(output.String())
+	page := normalizeNavbar(name, output.String())
 	if name == "dashboard.html" {
 		if values, ok := data.(map[string]any); ok {
 			if total, ok := values["AgentTotal"].(int); ok {
 				up, _ := values["AgentUp"].(int)
 				down, _ := values["AgentDown"].(int)
-				card := fmt.Sprintf(`<div class="card"><span class="muted">Agents</span><h2>%d</h2><span class="muted">%d online · %d offline</span><br><a href="/agents">View agents →</a></div>`, total, up, down)
-				page = strings.Replace(page, `<div class="grid">`, `<div class="grid">`+card, 1)
+				card := fmt.Sprintf(`<div class="card metric metric-agents"><span class="muted">Agents</span><h2>%d</h2><span class="metric-sub muted">%d online · %d offline</span></div>`, total, up, down)
+				page = strings.Replace(page, `<div class="grid metrics-grid">`, `<div class="grid metrics-grid">`+card, 1)
 			}
 		}
 	}
 	_, _ = io.WriteString(w, page)
 }
 
-// normalizeNavbar menjaga urutan menu tetap sama walaupun template lama masih inline.
-func normalizeNavbar(page string) string {
+// normalizeNavbar menjaga urutan menu tetap sama walaupun template lama masih inline dan menandai halaman aktif.
+func normalizeNavbar(name, page string) string {
 	start := strings.Index(page, "<nav>")
 	if start < 0 {
 		return page
@@ -1694,8 +1694,44 @@ func normalizeNavbar(page string) string {
 			logout = existingNav[formStart : formStart+formEnd+len("</form>")]
 		}
 	}
-	nav := `<nav><strong>MiniUptime</strong><a href="/dashboard">Dashboard</a><a href="/monitors">Monitors</a><a href="/agents">Agents</a><a href="/groups">Groups</a><a href="/incidents">Incidents</a><a href="/settings">Settings</a><a href="/display">Display</a>` + logout + `</nav>`
-	return page[:start] + nav + page[end+len("</nav>"):]
+	active := ""
+	switch name {
+	case "dashboard.html":
+		active = "/dashboard"
+	case "monitors.html", "monitor-form.html", "monitor-edit.html", "monitor-detail.html":
+		active = "/monitors"
+	case "agents.html", "agent-form.html", "agent-detail.html":
+		active = "/agents"
+	case "groups.html":
+		active = "/groups"
+	case "incidents.html":
+		active = "/incidents"
+	case "settings.html":
+		active = "/settings"
+	case "display.html", "display-pin.html":
+		active = "/display"
+	}
+	links := []struct{ href, label string }{
+		{"/dashboard", "Dashboard"},
+		{"/monitors", "Monitors"},
+		{"/agents", "Agents"},
+		{"/groups", "Groups"},
+		{"/incidents", "Incidents"},
+		{"/settings", "Settings"},
+		{"/display", "Display"},
+	}
+	var b strings.Builder
+	b.WriteString(`<nav><strong>MiniUptime</strong>`)
+	for _, l := range links {
+		if l.href == active {
+			fmt.Fprintf(&b, `<a href="%s" aria-current="page">%s</a>`, l.href, l.label)
+		} else {
+			fmt.Fprintf(&b, `<a href="%s">%s</a>`, l.href, l.label)
+		}
+	}
+	b.WriteString(logout)
+	b.WriteString(`</nav>`)
+	return page[:start] + b.String() + page[end+len("</nav>"):]
 }
 func hashPassword(p string) (string, error) {
 	salt := make([]byte, 16)

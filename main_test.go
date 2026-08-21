@@ -285,7 +285,7 @@ func TestRenderAddsAgentNavigationToLegacyPages(t *testing.T) {
 }
 
 func TestNormalizeNavbarUsesOneMenuOrder(t *testing.T) {
-	page := normalizeNavbar(`<main><nav><strong>MiniUptime</strong><a href="/settings">Settings</a><a href="/dashboard">Dashboard</a><form method="post" action="/logout"><input name="csrf"></form></nav></main>`)
+	page := normalizeNavbar("", `<main><nav><strong>MiniUptime</strong><a href="/settings">Settings</a><a href="/dashboard">Dashboard</a><form method="post" action="/logout"><input name="csrf"></form></nav></main>`)
 	order := []string{`href="/dashboard"`, `href="/monitors"`, `href="/agents"`, `href="/groups"`, `href="/incidents"`, `href="/settings"`, `href="/display"`}
 	previous := -1
 	for _, item := range order {
@@ -297,6 +297,20 @@ func TestNormalizeNavbarUsesOneMenuOrder(t *testing.T) {
 	}
 	if !strings.Contains(page, `action="/logout"`) {
 		t.Fatal("logout form was dropped")
+	}
+}
+
+func TestNormalizeNavbarMarksActivePage(t *testing.T) {
+	page := normalizeNavbar("monitors.html", `<main><nav><strong>MiniUptime</strong><a href="/dashboard">Dashboard</a></nav></main>`)
+	if count := strings.Count(page, `aria-current="page"`); count != 1 {
+		t.Fatalf("expected 1 active link, got %d: %s", count, page)
+	}
+	if !strings.Contains(page, `href="/monitors" aria-current="page"`) {
+		t.Fatal("monitors link should be active")
+	}
+	alias := normalizeNavbar("monitor-detail.html", `<main><nav><strong>MiniUptime</strong></nav></main>`)
+	if !strings.Contains(alias, `href="/monitors" aria-current="page"`) {
+		t.Fatal("monitor-detail should activate monitors nav")
 	}
 }
 
