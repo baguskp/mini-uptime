@@ -1,6 +1,6 @@
 ---
 timestamp: 2026-08-21 16:50 +07:00
-commit: pending
+commit: 025a0de
 topic: Accessibility & polish (P3)
 priority: P3
 ---
