@@ -1,6 +1,6 @@
 ---
 timestamp: 2026-08-21 21:05 +07:00
-commit: pending
+commit: 4bd7696
 topic: Template-first navigation — remove normalizeNavbar (P2)
 priority: P2
 ---
