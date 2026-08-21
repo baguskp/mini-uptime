@@ -645,16 +645,20 @@ func events(db *sql.DB) http.HandlerFunc {
 			case <-r.Context().Done():
 				return
 			case <-ticker.C:
-				rows, err := db.Query("SELECT id,current_status,last_latency_ms FROM monitors ORDER BY id")
+				rows, err := db.Query("SELECT id,current_status,last_latency_ms,COALESCE(checked_at,'') FROM monitors ORDER BY id")
 				if err != nil {
 					continue
 				}
 				var statuses []map[string]any
 				for rows.Next() {
 					var id, lat int
-					var status string
-					if rows.Scan(&id, &status, &lat) == nil {
-						statuses = append(statuses, map[string]any{"id": id, "status": status, "latency": lat})
+					var status, checkedAt string
+					if rows.Scan(&id, &status, &lat, &checkedAt) == nil {
+						checked := "Never checked"
+						if checkedAt != "" {
+							checked = humanTime(checkedAt)
+						}
+						statuses = append(statuses, map[string]any{"id": id, "status": status, "latency": lat, "checked": checked})
 					}
 				}
 				rows.Close()
@@ -1530,7 +1534,15 @@ func monitorDetail(db *sql.DB) http.HandlerFunc {
 			c["Height"] = h
 			c["Time"] = humanTime(c["At"].(string))
 		}
-		render(w, "monitor-detail.html", map[string]any{"Monitor": m, "Checks": checks, "Avg": avg, "P95": p95, "Min": minLatency, "Max": maxLatency})
+		graphCaption := "No checks yet"
+		if len(checks) == 1 {
+			graphCaption = checks[0]["Time"].(string) + " · last 1 check"
+		} else if len(checks) > 1 {
+			oldest := checks[len(checks)-1]["Time"].(string)
+			newest := checks[0]["Time"].(string)
+			graphCaption = oldest + " – " + newest + " · last 50 checks"
+		}
+		render(w, "monitor-detail.html", map[string]any{"Monitor": m, "Checks": checks, "Avg": avg, "P95": p95, "Min": minLatency, "Max": maxLatency, "GraphCaption": graphCaption})
 	}
 }
 func humanTime(value string) string {
