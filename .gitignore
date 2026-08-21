@@ -1,5 +1,6 @@
 data/
 .idea/
+.openchamber/
 *.db
 *.db-shm
 *.db-wal
