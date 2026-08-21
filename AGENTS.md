@@ -27,7 +27,8 @@ First run redirects to `/setup` (create admin: username ≥ 3 chars, password �
 
 ## Structure
 
-- `main.go` — everything: routes, handlers, check scheduler, SSE hub, migrations (~1700 lines, single file by design)
+- `main.go` — entry point only: `embed.FS` assets, global state, `main()`, `migrate()`, route wiring (~200 lines).
+- Handlers and helpers live in focused files, all `package main`: `auth.go`, `agents.go`, `monitors.go`, `groups.go`, `scheduler.go`, `display.go`, `dashboard.go`, `settings.go`, `incidents.go`, `telegram.go`, `render.go`, `util.go`.
 - `web/templates/*.html` — one file per page; each template is written as a single minified line. Keep that style.
 - `web/static/app.css` — the only stylesheet
 - `main_test.go` — unit tests
@@ -36,12 +37,13 @@ First run redirects to `/setup` (create admin: username ≥ 3 chars, password �
 ## Gotchas (read before editing)
 
 1. **CSS is layered, not merged.** `app.css` is a handful of physical lines; each sprint appended a new line that overrides earlier ones instead of editing them. To change styles, append a new line at the end — do not rewrite existing lines. Expect duplicate selectors and conflicting rules (e.g. two `nav a:hover` colors).
-2. **Nav is patched at render time.** `normalizeNavbar()` in `main.go` injects the "Agents" nav link into every page, and `render()` injects the Agents summary card into `dashboard.html` via string replace. Editing templates alone is not enough for nav/dashboard-card changes.
+2. **Nav is template-first.** Every nav-bearing template renders its own `<nav>`; `render()` injects an `Active` field (via `navActive()` in `render.go`) that drives `aria-current="page"` conditionals. The Agents link and the dashboard Agents card live directly in the templates — there is no runtime HTML patching anymore. Editing templates is sufficient.
 3. **`/display` returns 404** unless Settings → display mode is set to `public` or `pin` (`display_mode` setting). Not a bug.
 4. **All POST forms require a `csrf` hidden field** (see `csrf()` middleware).
 5. **Monitor interval minimum is 10 seconds** (`validMonitor`).
-6. **Dashboard live updates use SSE** (`/events`, event `status`). `/display` still uses `<meta refresh>` — known gap.
-7. Some classes used by templates have no CSS yet (e.g. `.detail-list`, `.small-metric` in `agent-detail.html`) — defining them is a legitimate fix, removing them is not.
+6. **Dashboard and `/display` live-update via SSE** (`/events`, event `status`). `/display` has no meta refresh; its script updates chips/latency/checked/summary and falls back to `location.reload()` after 30s if the stream errors.
+7. `.detail-list` and `.small-metric` (used by `agent-detail.html`) are defined in `app.css` — keep them; they are not placeholders.
+8. **Windows encoding hazard.** All repo files are UTF-8. Never pipe git or command output through PowerShell `Out-File` / `Set-Content` — PowerShell 5.1 decodes external output as cp437/cp1252 and silently corrupts non-ASCII bytes (`–`, `—`, `·` become mojibake like `ÔÇô`, `┬À`). Read/write via the file tools, or Python with `encoding='utf-8'`, or `git cat-file blob` written as raw bytes.
 
 ## Conventions
 
