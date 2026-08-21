@@ -1,6 +1,6 @@
 ---
 timestamp: 2026-08-21 16:50 +07:00
-commit: pending
+commit: 95e54f7
 topic: Navigation state & dashboard hierarchy (P1)
 priority: P1
 ---
