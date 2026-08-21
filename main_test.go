@@ -278,39 +278,21 @@ func TestAgentPagesRender(t *testing.T) {
 
 func TestRenderAddsAgentNavigationToLegacyPages(t *testing.T) {
 	w := httptest.NewRecorder()
-	render(w, "incidents.html", []map[string]string{})
-	if !strings.Contains(w.Body.String(), `href="/agents">Agents</a>`) {
+	render(w, "incidents.html", map[string]any{"Incidents": []map[string]string{}})
+	body := w.Body.String()
+	if !strings.Contains(body, `href="/agents"`) {
 		t.Fatal("legacy page is missing Agents navigation")
 	}
-}
-
-func TestNormalizeNavbarUsesOneMenuOrder(t *testing.T) {
-	page := normalizeNavbar("", `<main><nav><strong>MiniUptime</strong><a href="/settings">Settings</a><a href="/dashboard">Dashboard</a><form method="post" action="/logout"><input name="csrf"></form></nav></main>`)
-	order := []string{`href="/dashboard"`, `href="/monitors"`, `href="/agents"`, `href="/groups"`, `href="/incidents"`, `href="/settings"`, `href="/display"`}
-	previous := -1
-	for _, item := range order {
-		current := strings.Index(page, item)
-		if current <= previous {
-			t.Fatalf("menu item %q is out of order: %s", item, page)
-		}
-		previous = current
-	}
-	if !strings.Contains(page, `action="/logout"`) {
-		t.Fatal("logout form was dropped")
+	if !strings.Contains(body, `href="/incidents" aria-current="page"`) {
+		t.Fatal("incidents nav should be marked active")
 	}
 }
 
-func TestNormalizeNavbarMarksActivePage(t *testing.T) {
-	page := normalizeNavbar("monitors.html", `<main><nav><strong>MiniUptime</strong><a href="/dashboard">Dashboard</a></nav></main>`)
-	if count := strings.Count(page, `aria-current="page"`); count != 1 {
-		t.Fatalf("expected 1 active link, got %d: %s", count, page)
-	}
-	if !strings.Contains(page, `href="/monitors" aria-current="page"`) {
-		t.Fatal("monitors link should be active")
-	}
-	alias := normalizeNavbar("monitor-detail.html", `<main><nav><strong>MiniUptime</strong></nav></main>`)
-	if !strings.Contains(alias, `href="/monitors" aria-current="page"`) {
-		t.Fatal("monitor-detail should activate monitors nav")
+func TestRenderInjectsActiveState(t *testing.T) {
+	w := httptest.NewRecorder()
+	render(w, "monitors.html", map[string]any{})
+	if !strings.Contains(w.Body.String(), `href="/monitors" aria-current="page"`) {
+		t.Fatal("monitors nav should be marked active")
 	}
 }
 

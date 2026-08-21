@@ -1,13 +1,11 @@
-﻿package main
+package main
 
 import (
 	"bytes"
-	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -25,79 +23,34 @@ func render(w http.ResponseWriter, name string, data any) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
+	if values, ok := data.(map[string]any); ok {
+		values["Active"] = navActive(name)
+	}
 	var output bytes.Buffer
 	if err := t.Execute(&output, data); err != nil {
 		log.Printf("render %s: %v", name, err)
 		return
 	}
-	page := normalizeNavbar(name, output.String())
-	if name == "dashboard.html" {
-		if values, ok := data.(map[string]any); ok {
-			if total, ok := values["AgentTotal"].(int); ok {
-				up, _ := values["AgentUp"].(int)
-				down, _ := values["AgentDown"].(int)
-				card := fmt.Sprintf(`<div class="card metric metric-agents"><span class="muted">Agents</span><h2>%d</h2><span class="metric-sub muted">%d online · %d offline</span></div>`, total, up, down)
-				page = strings.Replace(page, `<div class="grid metrics-grid">`, `<div class="grid metrics-grid">`+card, 1)
-			}
-		}
-	}
-	_, _ = io.WriteString(w, page)
+	_, _ = io.WriteString(w, output.String())
 }
 
-// normalizeNavbar menjaga urutan menu tetap sama walaupun template lama masih inline dan menandai halaman aktif.
-func normalizeNavbar(name, page string) string {
-	start := strings.Index(page, "<nav>")
-	if start < 0 {
-		return page
-	}
-	relativeEnd := strings.Index(page[start:], "</nav>")
-	if relativeEnd < 0 {
-		return page
-	}
-	end := start + relativeEnd
-	existingNav := page[start:end]
-	logout := ""
-	if formStart := strings.Index(existingNav, `<form method="post" action="/logout"`); formStart >= 0 {
-		if formEnd := strings.Index(existingNav[formStart:], "</form>"); formEnd >= 0 {
-			logout = existingNav[formStart : formStart+formEnd+len("</form>")]
-		}
-	}
-	active := ""
+// navActive memetakan nama template ke path halaman aktif untuk aria-current di nav.
+func navActive(name string) string {
 	switch name {
 	case "dashboard.html":
-		active = "/dashboard"
+		return "/dashboard"
 	case "monitors.html", "monitor-form.html", "monitor-edit.html", "monitor-detail.html":
-		active = "/monitors"
+		return "/monitors"
 	case "agents.html", "agent-form.html", "agent-detail.html":
-		active = "/agents"
+		return "/agents"
 	case "groups.html":
-		active = "/groups"
+		return "/groups"
 	case "incidents.html":
-		active = "/incidents"
+		return "/incidents"
 	case "settings.html":
-		active = "/settings"
+		return "/settings"
 	case "display.html", "display-pin.html":
-		active = "/display"
+		return "/display"
 	}
-	links := []struct{ href, label string }{
-		{"/dashboard", "Dashboard"},
-		{"/monitors", "Monitors"},
-		{"/agents", "Agents"},
-		{"/groups", "Groups"},
-		{"/incidents", "Incidents"},
-		{"/settings", "Settings"},
-		{"/display", "Display"},
-	}
-	var b strings.Builder
-	b.WriteString(`<nav><strong>MiniUptime</strong>`)
-	for _, l := range links {
-		if l.href == active {
-			fmt.Fprintf(&b, `<a href="%s" aria-current="page">%s</a>`, l.href, l.label)
-		} else {
-			fmt.Fprintf(&b, `<a href="%s">%s</a>`, l.href, l.label)
-		}
-	}
-	b.WriteString(logout)
-	b.WriteString(`</nav>`)
-	return page[:start] + b.String() + page[end+len("</nav>"):]
+	return ""
 }

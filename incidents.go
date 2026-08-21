@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"database/sql"
@@ -23,6 +23,6 @@ func incidentsPage(db *sql.DB) http.HandlerFunc {
 			}
 			incidents = append(incidents, map[string]string{"Started": humanTime(started), "Ended": incidentEnded(ended), "Monitor": name, "Error": e})
 		}
-		render(w, "incidents.html", incidents)
+		render(w, "incidents.html", map[string]any{"Incidents": incidents})
 	}
 }
